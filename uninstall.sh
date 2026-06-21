@@ -3,12 +3,12 @@
 #
 # Idempotent: boots out the LaunchAgent, removes the plist, restores the most
 # recent Caddyfile backup (or writes a minimal passthrough), and reloads Caddy.
-# Leaves all ~/.config/lazydev/ code (daemon, registry, scripts) in place.
+# Leaves all project code (daemon, registry, scripts) in place.
 
 set -euo pipefail
 
-HOME_DIR="/Users/joudbitar"
-CONFIG_DIR="${HOME_DIR}/.config/lazydev"
+HOME_DIR="${HOME}"
+CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 LABEL="com.lazydev.proxy"
 PLIST="${HOME_DIR}/Library/LaunchAgents/${LABEL}.plist"
@@ -49,6 +49,16 @@ if [ -f "${PLIST}" ]; then
   ok "removed plist ${PLIST}"
 else
   warn "plist already absent (${PLIST})"
+fi
+
+# --------------------------------------------------------------------------
+# 2b. Remove the CLI symlink (only if it points into this project)
+# --------------------------------------------------------------------------
+
+CLI_LINK="${HOME_DIR}/.local/bin/lazydev"
+if [ -L "${CLI_LINK}" ] && [ "$(readlink "${CLI_LINK}")" = "${CONFIG_DIR}/lazydev" ]; then
+  rm -f "${CLI_LINK}"
+  ok "removed CLI symlink ${CLI_LINK}"
 fi
 
 # --------------------------------------------------------------------------

@@ -44,8 +44,8 @@ The proxy is installed as a macOS **LaunchAgent** (`com.lazydev.proxy`) plus a C
 config block, by the bundled scripts:
 
 ```bash
-~/.config/lazydev/install.sh      # writes the launchd plist + Caddyfile, loads both
-~/.config/lazydev/uninstall.sh    # tears them back down
+~/lazydev/install.sh      # writes the launchd plist + Caddyfile, loads both
+~/lazydev/uninstall.sh    # tears them back down
 ```
 
 The `lazydev` CLI is symlinked onto your PATH at `~/.local/bin/lazydev`.
@@ -147,12 +147,12 @@ Show usage.
 
 | Path | What |
 |------|------|
-| `~/.config/lazydev/projects.json` | The registry — every project lazydev knows about |
-| `~/.config/lazydev/logs/<host>.log` | Per-project dev-server output |
-| `~/.config/lazydev/logs/daemon.log` | The daemon's own log |
-| `~/.config/lazydev/lazydev` | This CLI (symlinked to `~/.local/bin/lazydev`) |
-| `~/.config/lazydev/lazydev.mjs` | The daemon (run by launchd) |
-| `~/.config/lazydev/scan.mjs` | The project scanner |
+| `~/lazydev/projects.json` | The registry — every project lazydev knows about |
+| `~/lazydev/logs/<host>.log` | Per-project dev-server output |
+| `~/lazydev/logs/daemon.log` | The daemon's own log |
+| `~/lazydev/lazydev` | This CLI (symlinked to `~/.local/bin/lazydev`) |
+| `~/lazydev/lazydev.mjs` | The daemon (run by launchd) |
+| `~/lazydev/scan.mjs` | The project scanner |
 | `~/Library/LaunchAgents/com.lazydev.proxy.plist` | The LaunchAgent that runs the daemon |
 
 ---
@@ -232,7 +232,7 @@ Projects sleep after 30 minutes of inactivity by default. To change it, edit
 `idleTimeoutMs` (milliseconds) at the top of `projects.json`, then restart:
 
 ```jsonc
-// ~/.config/lazydev/projects.json
+// ~/lazydev/projects.json
 {
   "idleTimeoutMs": 3600000,   // 1 hour
   ...
@@ -255,4 +255,4 @@ resources aggressively.
 - **A project won't load** — `lazydev logs <host> -f` shows its dev-server output;
   most failures (a missing dependency, a port conflict, a build error) show up there.
 - **`lazydev status` shows Caddy DOWN** — Caddy isn't bound to :80; re-run
-  `~/.config/lazydev/install.sh` or restart it via `brew services restart caddy`.
+  `~/lazydev/install.sh` or restart it via `brew services restart caddy`.

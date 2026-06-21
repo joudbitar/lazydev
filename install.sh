@@ -5,7 +5,7 @@
 # daemon on :4000, installs the wildcard *.localhost Caddyfile, and reloads
 # Caddy on :80. Validates the daemon and registry before touching anything.
 #
-# See ~/.config/lazydev/SPEC.md for the topology.
+# See ./SPEC.md (project root) for the topology.
 
 set -euo pipefail
 
@@ -13,8 +13,10 @@ set -euo pipefail
 # Constants (single-sourced)
 # --------------------------------------------------------------------------
 
-HOME_DIR="/Users/joudbitar"
-CONFIG_DIR="${HOME_DIR}/.config/lazydev"
+HOME_DIR="${HOME}"
+# This installer lives at the project root — install whatever folder it's in,
+# so the project is fully relocatable (clone/move it anywhere, then run this).
+CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON="${CONFIG_DIR}/lazydev.mjs"
 REGISTRY="${CONFIG_DIR}/projects.json"
 LOGS_DIR="${CONFIG_DIR}/logs"
@@ -173,6 +175,15 @@ else
   warn "daemon did NOT come up on :${DAEMON_PORT} within ~10s"
   warn "check ${LOGS_DIR}/daemon.err and ${LOGS_DIR}/daemon.log"
 fi
+
+# --------------------------------------------------------------------------
+# 3b. Link the CLI onto PATH (~/.local/bin/lazydev)
+# --------------------------------------------------------------------------
+
+info "Linking CLI -> ${HOME_DIR}/.local/bin/lazydev"
+mkdir -p "${HOME_DIR}/.local/bin"
+ln -sf "${CONFIG_DIR}/lazydev" "${HOME_DIR}/.local/bin/lazydev"
+ok "lazydev CLI linked (make sure ${HOME_DIR}/.local/bin is on your PATH)"
 
 # --------------------------------------------------------------------------
 # 4. Write the wildcard Caddyfile + reload Caddy

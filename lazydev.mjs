@@ -2,22 +2,23 @@
 // lazydev — on-demand local dev-server proxy daemon.
 // Zero npm dependencies. Node v22 built-ins only.
 //
-// See ~/.config/lazydev/SPEC.md for the full build contract.
+// See ./SPEC.md (project root) for the full build contract.
 
 import http from 'node:http';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Paths & constants
 // ---------------------------------------------------------------------------
 
-const HOME = os.homedir();
-const CONFIG_DIR = path.join(HOME, '.config', 'lazydev');
+// Resolve all state relative to THIS file's directory, so the whole project is
+// relocatable: move or clone it anywhere and the registry, logs, and daemon
+// travel together. (Was hardcoded to ~/.config/lazydev before centralizing.)
+const CONFIG_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LOGS_DIR = path.join(CONFIG_DIR, 'logs');
 const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
 const CONFIG_PATH = process.env.LAZYDEV_CONFIG || path.join(CONFIG_DIR, 'projects.json');

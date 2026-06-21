@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // lazydev REGISTRY scanner.
 // Scans ~ for Node web projects with a `dev` script and writes/merges
-// ~/.config/lazydev/projects.json per the lazydev BUILD CONTRACT (SPEC.md).
+// <project-root>/projects.json per the lazydev BUILD CONTRACT (SPEC.md).
 // Zero npm deps — Node built-ins only.
 
 import { readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -9,7 +9,10 @@ import { join, basename, dirname } from 'node:path';
 import os from 'node:os';
 
 const HOME = os.homedir();
-const CONFIG_DIR = join(HOME, '.config', 'lazydev');
+// Self-locate: write the registry next to this script (project root), not a
+// hardcoded ~/.config path, so the project is relocatable. HOME below is still
+// the directory tree we SCAN for projects.
+const CONFIG_DIR = import.meta.dirname;
 const OUT = join(CONFIG_DIR, 'projects.json');
 const MAXDEPTH = 4;
 

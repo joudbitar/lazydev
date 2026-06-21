@@ -14,7 +14,15 @@ set -euo pipefail
 DAEMON_PORT=4000
 DAEMON_HOST="lazydev.localhost"
 BASE_URL="http://localhost:${DAEMON_PORT}"
-CONFIG_DIR="${HOME}/.config/lazydev"
+# Resolve this script's real directory, following the PATH symlink, so the CLI
+# finds its sibling scan.mjs / projects.json / logs wherever the project lives.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+CONFIG_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 LOG_DIR="${CONFIG_DIR}/logs"
 DAEMON_LOG="${LOG_DIR}/daemon.log"
 PROJECTS_JSON="${CONFIG_DIR}/projects.json"

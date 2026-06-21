@@ -27,7 +27,7 @@ browser  ->  http://<host>.localhost            (e.g. http://tradepulse.localhos
 - HOME = `/Users/joudbitar`. macOS (darwin), zsh.
 - Daemon listens on **:4000**. Caddy binds :80 with NO sudo on this machine.
 
-## Files (all under `~/.config/lazydev/`)
+## Files (all under `~/lazydev/`)
 
 | File | Owner agent | Purpose |
 |------|-------------|---------|
