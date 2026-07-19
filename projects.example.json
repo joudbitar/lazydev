@@ -1,0 +1,35 @@
+{
+  "port": 4000,
+  "idleTimeoutMs": 1800000,
+  "startTimeoutMs": 120000,
+  "scanExclude": [
+    "/archive/",
+    "/scratch/"
+  ],
+  "projects": [
+    {
+      "host": "webapp",
+      "dir": "/Users/you/code/webapp",
+      "port": 3000,
+      "startCmd": "pnpm dev",
+      "framework": "next",
+      "enabled": true
+    },
+    {
+      "host": "marketing",
+      "dir": "/Users/you/code/marketing-site",
+      "port": 3010,
+      "startCmd": "npm run dev -- --port 3010 --strictPort",
+      "framework": "vite",
+      "enabled": true
+    },
+    {
+      "host": "docs",
+      "dir": "/Users/you/code/docs",
+      "port": 3020,
+      "startCmd": "python3 -m http.server 3020 --bind 127.0.0.1",
+      "framework": "node",
+      "enabled": false
+    }
+  ]
+}

@@ -28,8 +28,6 @@ const SKIP = new Set([
 // Host name we must never emit (the daemon owns it).
 const RESERVED_HOST = 'lazydev';
 
-// tradepulse is pinned to this port; everyone else draws from POOL_START/POOL_STEP.
-const PINNED = { tradepulse: 3000 };
 const POOL_START = 3010;
 const POOL_STEP = 10;
 
@@ -38,6 +36,23 @@ const VITE_BASED = new Set(['vite', 'astro', 'remix', 'sveltekit']);
 
 // A "node"-type dev script only counts as a web/dev server if it looks like one.
 const SERVER_HINT = /\b(next|vite|astro|remix|svelte|webpack|serve|start|dev-server|nodemon)\b/;
+
+// ---------------------------------------------------------------------------
+// 0. Load the existing registry up front: scan config lives there, and the
+//    merge in step 7 preserves everything it already knows.
+// ---------------------------------------------------------------------------
+let existing = null;
+if (existsSync(OUT)) {
+  try { existing = JSON.parse(readFileSync(OUT, 'utf8')); } catch { existing = null; }
+}
+const existingByHost = new Map();
+if (existing && Array.isArray(existing.projects)) {
+  for (const p of existing.projects) {
+    if (p && typeof p.host === 'string') existingByHost.set(p.host, p);
+  }
+}
+// Optional registry config: path substrings the scanner must skip.
+const scanExclude = existing && Array.isArray(existing.scanExclude) ? existing.scanExclude : [];
 
 // ---------------------------------------------------------------------------
 // 1. Walk the home dir, collecting project roots (a dir with a package.json).
@@ -64,10 +79,8 @@ walk(HOME, 0);
 // 2. Exclusion rules (hard skips).
 // ---------------------------------------------------------------------------
 function isExcluded(dir, framework, dev) {
-  // Path matching */life/memory (CLI tool, no HTTP).
-  if (dir === join(HOME, 'life', 'memory') || dir.endsWith('/life/memory')) return true;
-  // Any dir whose name starts with tradepulse-marathon (transient worktrees).
-  if (basename(dir).startsWith('tradepulse-marathon')) return true;
+  // Registry config: skip any dir whose path contains a scanExclude entry.
+  if (scanExclude.some((s) => typeof s === 'string' && s && dir.includes(s))) return true;
   // Plain node project whose dev script doesn't look like a web/dev server.
   if (framework === 'node' && !SERVER_HINT.test(dev)) return true;
   return false;
@@ -155,25 +168,14 @@ function startCmdFor(framework, pm, port) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Merge with existing registry: preserve port/enabled/startCmd for known
-//    hosts; only assign fresh ports to newly-discovered hosts.
+// 7. Merge with the existing registry (loaded in step 0): preserve
+//    port/enabled/startCmd for known hosts; fresh ports only for new hosts.
 // ---------------------------------------------------------------------------
-let existing = null;
-if (existsSync(OUT)) {
-  try { existing = JSON.parse(readFileSync(OUT, 'utf8')); } catch { existing = null; }
-}
-const existingByHost = new Map();
-if (existing && Array.isArray(existing.projects)) {
-  for (const p of existing.projects) {
-    if (p && typeof p.host === 'string') existingByHost.set(p.host, p);
-  }
-}
 
-// Collect ports already taken (pinned + any preserved from existing).
-const takenPorts = new Set(Object.values(PINNED));
-for (const c of candidates) {
-  const prev = existingByHost.get(c.host);
-  if (prev && Number.isFinite(prev.port)) takenPorts.add(prev.port);
+// Ports already taken by anything the registry knows about.
+const takenPorts = new Set();
+for (const p of existingByHost.values()) {
+  if (Number.isFinite(p.port)) takenPorts.add(p.port);
 }
 
 function nextFreePort() {
@@ -187,10 +189,6 @@ function nextFreePort() {
 const sortedByHost = [...candidates].sort((a, b) => a.host.localeCompare(b.host));
 const portByHost = new Map();
 for (const c of sortedByHost) {
-  if (c.host in PINNED || PINNED[c.host] !== undefined) {
-    portByHost.set(c.host, PINNED[c.host]);
-    continue;
-  }
   const prev = existingByHost.get(c.host);
   if (prev && Number.isFinite(prev.port)) {
     portByHost.set(c.host, prev.port); // preserve existing
@@ -219,10 +217,20 @@ const projects = candidates.map((c) => {
   };
 });
 
+// Carry over registry entries the walk didn't rediscover (hand-added static
+// servers, projects outside HOME) as long as their directory still exists.
+const discovered = new Set(projects.map((p) => p.host));
+for (const [host, prev] of existingByHost) {
+  if (discovered.has(host)) continue;
+  if (!prev.dir || !existsSync(prev.dir)) continue;
+  projects.push(prev);
+}
+
 const out = {
-  port: 4000,
-  idleTimeoutMs: 1800000,
-  startTimeoutMs: 120000,
+  port: existing && Number.isFinite(existing.port) ? existing.port : 4000,
+  idleTimeoutMs: existing && Number.isFinite(existing.idleTimeoutMs) ? existing.idleTimeoutMs : 1800000,
+  startTimeoutMs: existing && Number.isFinite(existing.startTimeoutMs) ? existing.startTimeoutMs : 120000,
+  ...(scanExclude.length ? { scanExclude } : {}),
   projects,
 };
 

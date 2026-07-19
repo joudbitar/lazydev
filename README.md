@@ -1,258 +1,78 @@
 # lazydev
 
-**On-demand local dev-server proxy.** Every project you work on is reachable at a
-stable URL — `http://<host>.localhost` — whether or not its dev server is
-currently running. The first request to a URL *wakes* that project's dev server;
-after **30 minutes of inactivity** lazydev *sleeps* it again to free RAM, CPU, and
-its port. Think "Vercel preview URLs, but local, with sleep/wake."
+A local proxy that starts dev servers on demand behind permanent URLs.
 
-You stop juggling `pnpm dev` in fifteen terminal tabs and remembering which one is
-on which port. You just visit `http://tradepulse.localhost` and it's there.
-
----
-
-## How it works (architecture)
+Every project on your machine gets a stable address, `http://<name>.localhost`, whether or not its dev server is running. The first request wakes the server; thirty idle minutes put it back to sleep. You stop running `pnpm dev` in fifteen tabs, stop guessing which port is which, and stop feeding RAM to a server you opened on Tuesday.
 
 ```
-browser  ->  http://<host>.localhost          e.g. http://tradepulse.localhost
-         ->  Caddy on :80                      wildcard *.localhost  ->  localhost:4000
-         ->  lazydev daemon on :4000
-               1. read the Host header  ->  figure out which project
-               2. if that project's dev server is asleep, start it (and wait)
-               3. reverse-proxy the request (HTTP + WebSocket/HMR) to its port
-               4. record "last accessed"; a background reaper sleeps idle projects
-         ->  the project's own dev server on its fixed port   e.g. :3000
+$ lazydev
+lazydev  daemon up 1h  ·  sleeps idle projects after 30m
+
+HOST        URL                          STATE     IDLE  PORT
+admin       http://admin.localhost       sleeping  —     3020
+api         http://api.localhost         running   2m    3040
+blog        http://blog.localhost        sleeping  —     3050
+docs        http://docs.localhost        sleeping  —     3060
+marketing   http://marketing.localhost   sleeping  —     3010
+webapp      http://webapp.localhost      running   6s    3000
 ```
 
-Three layers:
+<!-- gif: visit a sleeping project in the browser. the tab spins a few seconds while the server boots, then the app appears. record ~10s with QuickTime or Kap, crop to the browser window. -->
 
-- **Caddy (:80)** owns the wildcard `*.localhost` and forwards everything to the
-  daemon. It's the only thing bound to port 80.
-- **lazydev daemon (:4000)** is the brain: it maps hostnames to projects, starts/stops
-  dev servers on demand, proxies traffic, and reaps idle projects.
-- **Your dev servers** (Next, Vite, etc.) each run on their own fixed port. lazydev
-  starts and stops them for you — you never run `pnpm dev` by hand again.
+## how it works
 
-Nothing here needs `sudo`, and the daemon has **zero npm dependencies** (Node
-built-ins only).
+Visit `http://<name>.localhost`. If that project's dev server is up, the request is proxied straight to it. If it's asleep, lazydev runs the project's start command, waits for the port to answer, then proxies. After 30 minutes without traffic the server is killed and its port freed. The URL never changes; only the process comes and goes. A cold start of a Next app takes about 8 seconds on my machine, timed with curl.
 
----
+The CLI:
 
-## Install / uninstall
+```
+lazydev              status table: every project, URL, state, idle time, port
+lazydev open <x>     wake <x> and open it in the browser
+lazydev sleep <x>    stop <x> now instead of waiting for the idle timer
+lazydev logs <x> -f  tail <x>'s dev-server output
+lazydev scan         find new projects and register them
+lazydev dash         the status table as a web page, at http://lazydev.localhost
+lazydev restart      bounce the daemon
+```
 
-The proxy is installed as a macOS **LaunchAgent** (`com.lazydev.proxy`) plus a Caddy
-config block, by the bundled scripts:
+To add a project, put it anywhere under your home directory and run `lazydev scan`. Anything with a `dev` script in its `package.json` gets found, assigned a free port, and merged into the registry without touching entries you've edited by hand. Everything else (a static folder, a Python server) is one JSON entry in `projects.json`: name, directory, port, start command.
+
+Hot-module reload works through the proxy; WebSocket connections are piped raw. Subdomains route to their parent project, so `tenant.myapp.localhost` reaches `myapp` with the Host header intact and your app's multi-tenant logic still sees `tenant`.
+
+## run it locally
+
+macOS, Node 20+, and Caddy (`brew install caddy`).
 
 ```bash
-~/lazydev/install.sh      # writes the launchd plist + Caddyfile, loads both
-~/lazydev/uninstall.sh    # tears them back down
-```
-
-The `lazydev` CLI is symlinked onto your PATH at `~/.local/bin/lazydev`.
-
----
-
-## CLI commands
-
-Run `lazydev help` any time. All commands:
-
-### `lazydev` &nbsp;/&nbsp; `lazydev ls`
-The status table. Shows the daemon's uptime and idle-timeout up top, then one row
-per project: host, its `http://<host>.localhost` URL, state, how long it's been idle,
-and its port.
-
-```
-lazydev  daemon up 2h  ·  sleeps idle projects after 30m
-
-HOST           URL                             STATE     IDLE  PORT
-tradepulse     http://tradepulse.localhost     running   4m    3000
-traypal        http://traypal.localhost        starting  —     3110
-sahtein-menus  http://sahtein-menus.localhost  sleeping  —     3100
-```
-
-State is colored: **running** = green, **starting** = yellow, **sleeping** (stopped)
-and disabled projects = dim. If the daemon isn't reachable on :4000, it says so and
-suggests `lazydev restart`.
-
-### `lazydev open <host>`
-Wake the project (if asleep) and open `http://<host>.localhost` in your browser.
-
-```bash
-lazydev open tradepulse
-```
-
-### `lazydev sleep <host>`
-Put a project to sleep right now (don't wait for the 30-minute idle timer). Frees its
-port immediately.
-
-```bash
-lazydev sleep traypal
-```
-
-### `lazydev logs <host> [-f]`
-Tail that project's dev-server log. Add `-f` to follow live (like `tail -f`).
-
-```bash
-lazydev logs tradepulse        # last 200 lines
-lazydev logs tradepulse -f     # follow
-```
-
-If the project hasn't started yet there's no log; the CLI tells you to `lazydev open`
-it first.
-
-### `lazydev daemon-logs [-f]`
-Tail the daemon's own log (lifecycle events, proxy errors, reaper activity). `-f` to
-follow.
-
-```bash
-lazydev daemon-logs -f
-```
-
-### `lazydev scan`
-Rescan your home directory for projects, merge them into the registry, tell the daemon
-to reload, then print the table. **This is how you add a project** (see below).
-
-```bash
+git clone https://github.com/joudbitar/lazydev ~/lazydev
+~/lazydev/install.sh
 lazydev scan
 ```
 
-### `lazydev restart`
-Restart the daemon (via `launchctl kickstart`, falling back to unload/load of the
-plist), wait for :4000 to come back, then print the table. Use this after editing
-`projects.json` by hand, or if the daemon seems wedged.
+`install.sh` loads a LaunchAgent for the daemon and adds a three-line wildcard block to your Caddyfile, then reloads both. No sudo anywhere. `uninstall.sh` puts everything back.
 
-```bash
-lazydev restart
-```
+## how it's built
 
-### `lazydev status`
-One-line health check: is the daemon listening on :4000, and is Caddy listening on
-:80? Prints `OK` / `DOWN` for each.
+The daemon is one Node file with zero npm dependencies: router, reverse proxy, process supervisor, and idle reaper in about 1,200 lines of built-ins. Caddy sits in front. launchd keeps it alive. The registry is one JSON file.
 
-```bash
-lazydev status
-# daemon (:4000)  OK
-# caddy  (:80)  OK
-```
+The decisions that matter:
 
-### `lazydev dash`
-Open the daemon's built-in HTML dashboard at `http://lazydev.localhost`.
+- Caddy owns port 80 and forwards every `*.localhost` request to the daemon on 4000. The daemon restarts constantly (registry reloads, upgrades, crashes) and the front door never drops. It also means https is a Caddy config line away instead of a TLS implementation in Node.
+- Dev servers spawn as process-group leaders, so sleeping a project kills the whole tree with one signal: pnpm, the framework under it, its workers. No orphaned process squatting port 3000.
+- `*.localhost` resolves to your own machine by web standard (RFC 6761), so there is nothing to set up: no /etc/hosts edits, no custom DNS resolver, no browser proxy config.
+- Health probes try both loopbacks. On some Macs `localhost` resolves only to `::1`, and plenty of dev servers listen on one family only; probing `127.0.0.1` and `::1` separately is the difference between "it works" and a mystery 502.
+- `scan` merges instead of overwriting, so a rescan never clobbers the port or start command you fixed by hand.
 
-### `lazydev help` &nbsp;/&nbsp; `-h` &nbsp;/&nbsp; `--help`
-Show usage.
+## what it doesn't do
 
----
+- Linux. The daemon is portable Node, but the installer is macOS launchd. A systemd port is the PR I'd merge first.
+- https, yet. See the Caddy note above.
+- Anything except dev servers. Databases, Docker, queues, and tunnels are out of scope. It is also not a production process manager; stopping idle servers is the point here and the opposite of what production wants.
 
-## Where things live
+## alternatives
 
-| Path | What |
-|------|------|
-| `~/lazydev/projects.json` | The registry — every project lazydev knows about |
-| `~/lazydev/logs/<host>.log` | Per-project dev-server output |
-| `~/lazydev/logs/daemon.log` | The daemon's own log |
-| `~/lazydev/lazydev` | This CLI (symlinked to `~/.local/bin/lazydev`) |
-| `~/lazydev/lazydev.mjs` | The daemon (run by launchd) |
-| `~/lazydev/scan.mjs` | The project scanner |
-| `~/Library/LaunchAgents/com.lazydev.proxy.plist` | The LaunchAgent that runs the daemon |
+[hotel](https://github.com/typicode/hotel) proved people want this (10k stars) and then went quiet; it starts servers on access but never stops them, and pretty domains need a browser proxy config. [chalet](https://github.com/jeansaad/chalet) is its maintained fork, same model. [puma-dev](https://github.com/puma/puma-dev) has real wake and sleep but is built around Rails and installs its own DNS resolver for `.test`. [rpx](https://github.com/stacksjs/rpx) is the closest living tool, part of the Stacks ecosystem. Use lazydev if you want a permanent URL for every project, your RAM back, and a codebase you can read in one sitting.
 
----
+## license
 
-## Adding a project
-
-The easy way — drop a project anywhere under your home directory, then:
-
-```bash
-lazydev scan
-```
-
-`scan` finds web projects (a `package.json` with a `dev` script), merges any new ones
-into `projects.json` without clobbering your existing entries, reloads the daemon, and
-prints the updated table. Your new project is now live at `http://<host>.localhost`.
-
-If you need to tweak how a project starts — its port, its start command, or its
-framework — edit its entry in `projects.json` directly. The registry shape:
-
-```json
-{
-  "port": 4000,
-  "idleTimeoutMs": 1800000,
-  "startTimeoutMs": 120000,
-  "projects": [
-    {
-      "host": "tradepulse",
-      "dir": "/Users/joudbitar/tradepulse",
-      "port": 3000,
-      "startCmd": "pnpm dev",
-      "framework": "next",
-      "enabled": true
-    }
-  ]
-}
-```
-
-- **`host`** — the subdomain label; the URL is `http://<host>.localhost`. Must be unique.
-- **`dir`** — absolute project directory.
-- **`port`** — the fixed port lazydev runs and proxies this project on.
-- **`startCmd`** — run with the project dir as the working directory; lazydev injects
-  `PORT=<port>`. Vite ignores `PORT`, so Vite projects must pass
-  `--port <port> --strictPort` in the command explicitly.
-- **`framework`** — `next | vite | cra | astro | remix | sveltekit | node` (informational).
-- **`enabled`** — set to `false` to keep a project registered but parked; the daemon
-  serves a "disabled" page instead of starting it.
-
-After editing `projects.json` by hand, run `lazydev restart` (or `lazydev scan`, which
-also reloads) to apply it.
-
----
-
-## Prod-style subdomain routing
-
-Real apps often serve different tenants on different subdomains
-(`acme.yourapp.com`, `globex.yourapp.com`). lazydev mirrors that locally so your
-multi-tenant code path actually runs.
-
-When resolving a hostname, lazydev takes the **last** label before `.localhost` as the
-project key:
-
-| You visit | Routes to project | App's `Host` header sees |
-|-----------|-------------------|--------------------------|
-| `traypal.localhost` | `traypal` | `traypal.localhost` |
-| `trinity.traypal.localhost` | `traypal` | `trinity.traypal.localhost` |
-
-So `trinity.traypal.localhost` is handled by the **traypal** project, but the
-**original Host header is preserved** when proxied upstream — your app's own
-multi-tenant logic still sees `trinity` and can serve that tenant. One dev server,
-many tenant subdomains, no extra config.
-
----
-
-## Changing the idle timeout
-
-Projects sleep after 30 minutes of inactivity by default. To change it, edit
-`idleTimeoutMs` (milliseconds) at the top of `projects.json`, then restart:
-
-```jsonc
-// ~/lazydev/projects.json
-{
-  "idleTimeoutMs": 3600000,   // 1 hour
-  ...
-}
-```
-
-```bash
-lazydev restart
-```
-
-Set it large if you want projects to stay warm longer; set it small to reclaim
-resources aggressively.
-
----
-
-## Troubleshooting
-
-- **`lazydev ls` says the daemon is unreachable** — run `lazydev restart`, then
-  `lazydev status`. If it still won't come up, check `lazydev daemon-logs`.
-- **A project won't load** — `lazydev logs <host> -f` shows its dev-server output;
-  most failures (a missing dependency, a port conflict, a build error) show up there.
-- **`lazydev status` shows Caddy DOWN** — Caddy isn't bound to :80; re-run
-  `~/lazydev/install.sh` or restart it via `brew services restart caddy`.
+MIT

@@ -13,8 +13,9 @@ CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LABEL="com.lazydev.proxy"
 PLIST="${HOME_DIR}/Library/LaunchAgents/${LABEL}.plist"
 
-CADDYFILE="/opt/homebrew/etc/Caddyfile"
-CADDY_BIN="/opt/homebrew/bin/caddy"
+CADDY_BIN="$(command -v caddy || echo /opt/homebrew/bin/caddy)"
+BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+CADDYFILE="${BREW_PREFIX:-/opt/homebrew}/etc/Caddyfile"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
@@ -62,28 +63,33 @@ if [ -L "${CLI_LINK}" ] && [ "$(readlink "${CLI_LINK}")" = "${CONFIG_DIR}/lazyde
 fi
 
 # --------------------------------------------------------------------------
-# 3. Restore the Caddyfile
+# 3. Remove the lazydev block from the Caddyfile (leave other sites intact)
 # --------------------------------------------------------------------------
 
-info "Restoring Caddyfile"
+info "Removing lazydev block from Caddyfile"
 
-# Find the most recent Caddyfile.bak.* (newest by name; timestamps sort lexically).
-LATEST_BAK=""
-for f in "${CADDYFILE}".bak.*; do
-  [ -e "${f}" ] || continue
-  LATEST_BAK="${f}"
-done
-
-if [ -n "${LATEST_BAK}" ]; then
-  cp "${LATEST_BAK}" "${CADDYFILE}"
-  ok "restored ${CADDYFILE} from ${LATEST_BAK}"
+if [ -f "${CADDYFILE}" ] && grep -q "Managed by lazydev" "${CADDYFILE}"; then
+  cp "${CADDYFILE}" "${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)"
+  # Drop the two comment lines, the "http://*.localhost ... {" opener, its
+  # reverse_proxy line, and the closing brace — the exact block install appended.
+  node -e '
+    const fs = require("fs");
+    const f = process.argv[1];
+    const lines = fs.readFileSync(f, "utf8").split("\n");
+    const out = [];
+    let skip = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].includes("Managed by lazydev")) { skip = 1; continue; }
+      if (skip && lines[i].includes("*.localhost") && lines[i].includes("{")) { skip = 2; continue; }
+      if (skip === 2) { if (lines[i].trim() === "}") skip = 0; continue; }
+      if (skip === 1) { if (lines[i].trim().startsWith("#") || lines[i].trim() === "") continue; skip = 0; }
+      out.push(lines[i]);
+    }
+    fs.writeFileSync(f, out.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, ""));
+  ' "${CADDYFILE}"
+  ok "removed lazydev block (backup alongside)"
 else
-  warn "no Caddyfile.bak.* found; writing a minimal passthrough"
-  cat > "${CADDYFILE}" <<'CADDY_EOF'
-# Minimal passthrough written by lazydev uninstall (no prior backup found).
-# No sites configured. Add your own server blocks here.
-CADDY_EOF
-  ok "wrote minimal passthrough ${CADDYFILE}"
+  warn "no lazydev block found in Caddyfile (already gone)"
 fi
 
 # --------------------------------------------------------------------------

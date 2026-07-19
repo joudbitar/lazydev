@@ -29,7 +29,7 @@ PROJECTS_JSON="${CONFIG_DIR}/projects.json"
 SCAN_SCRIPT="${CONFIG_DIR}/scan.mjs"
 PLIST_LABEL="com.lazydev.proxy"
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
-NODE="/usr/local/bin/node"
+NODE="$(command -v node || echo node)"
 
 # ---------------------------------------------------------------------------
 # Colors (TTY only — no escape codes when piped/redirected)

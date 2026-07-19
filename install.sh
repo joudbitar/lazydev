@@ -21,23 +21,11 @@ DAEMON="${CONFIG_DIR}/lazydev.mjs"
 REGISTRY="${CONFIG_DIR}/projects.json"
 LOGS_DIR="${CONFIG_DIR}/logs"
 
-NODE_BIN="/usr/local/bin/node"
-
 LABEL="com.lazydev.proxy"
 PLIST="${HOME_DIR}/Library/LaunchAgents/${LABEL}.plist"
 
-CADDYFILE="/opt/homebrew/etc/Caddyfile"
-CADDY_BIN="/opt/homebrew/bin/caddy"
-
 DAEMON_PORT=4000
 CADDY_PORT=80
-
-# launchd PATH: launchd hands processes a minimal PATH, but the daemon spawns
-# `pnpm dev` / `npm run dev`, so node, pnpm, npm AND caddy must all be reachable.
-#   node               -> /usr/local/bin
-#   pnpm / npm          -> /Users/joudbitar/.npm-global/bin (and ~/Library/pnpm)
-#   caddy               -> /opt/homebrew/bin
-LAUNCHD_PATH="/Users/joudbitar/.npm-global/bin:/Users/joudbitar/Library/pnpm:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
@@ -50,9 +38,39 @@ fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 info "Validating daemon + registry"
 
-[ -x "${NODE_BIN}" ] || fail "node not found/executable at ${NODE_BIN}"
+# Locate the tools on THIS machine; no hardcoded install paths.
+NODE_BIN="$(command -v node || true)"
+[ -n "${NODE_BIN}" ] || fail "node not found on PATH (need Node 18+)"
+
+CADDY_BIN="$(command -v caddy || true)"
+if [ -z "${CADDY_BIN}" ]; then
+  for c in /opt/homebrew/bin/caddy /usr/local/bin/caddy; do
+    if [ -x "${c}" ]; then CADDY_BIN="${c}"; break; fi
+  done
+fi
+[ -n "${CADDY_BIN}" ] || fail "caddy not found (brew install caddy)"
+
+BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+CADDYFILE="${BREW_PREFIX:-/opt/homebrew}/etc/Caddyfile"
+
+# launchd hands processes a minimal PATH, but the daemon spawns `pnpm dev` /
+# `npm run dev`, so node, the package managers, and caddy must all be reachable.
+LAUNCHD_PATH="$(dirname "${NODE_BIN}"):$(dirname "${CADDY_BIN}")"
+for tool in npm pnpm yarn bun; do
+  p="$(command -v "${tool}" 2>/dev/null || true)"
+  if [ -n "${p}" ]; then LAUNCHD_PATH="${LAUNCHD_PATH}:$(dirname "${p}")"; fi
+done
+# pnpm's default PNPM_HOME on macOS, if present.
+if [ -d "${HOME_DIR}/Library/pnpm" ]; then LAUNCHD_PATH="${LAUNCHD_PATH}:${HOME_DIR}/Library/pnpm"; fi
+LAUNCHD_PATH="${LAUNCHD_PATH}:${HOME_DIR}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+LAUNCHD_PATH="$(printf '%s' "${LAUNCHD_PATH}" | awk -v RS=: '!seen[$0]++ { printf "%s%s", sep, $0; sep=":" }')"
+ok "tools: node=${NODE_BIN}, caddy=${CADDY_BIN}"
+
 [ -f "${DAEMON}" ]   || fail "daemon not found at ${DAEMON}"
-[ -f "${REGISTRY}" ] || fail "registry not found at ${REGISTRY}"
+if [ ! -f "${REGISTRY}" ]; then
+  printf '%s\n' '{ "port": 4000, "idleTimeoutMs": 1800000, "startTimeoutMs": 120000, "projects": [] }' > "${REGISTRY}"
+  ok "created empty registry (run 'lazydev scan' to fill it)"
+fi
 
 if ! "${NODE_BIN}" --check "${DAEMON}"; then
   fail "syntax check failed: ${DAEMON}"
@@ -189,26 +207,29 @@ ok "lazydev CLI linked (make sure ${HOME_DIR}/.local/bin is on your PATH)"
 # 4. Write the wildcard Caddyfile + reload Caddy
 # --------------------------------------------------------------------------
 
-info "Installing wildcard Caddyfile -> ${CADDYFILE}"
+info "Installing wildcard Caddyfile block -> ${CADDYFILE}"
 
 mkdir -p "$(dirname "${CADDYFILE}")"
 
-# Back up the existing Caddyfile before replacing it.
-if [ -f "${CADDYFILE}" ]; then
-  BACKUP="${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "${CADDYFILE}" "${BACKUP}"
-  ok "backed up existing Caddyfile -> ${BACKUP}"
-fi
+# Append the lazydev block if it isn't there yet; never clobber other sites.
+if [ -f "${CADDYFILE}" ] && grep -q "Managed by lazydev" "${CADDYFILE}"; then
+  ok "Caddyfile already has the lazydev block"
+else
+  if [ -f "${CADDYFILE}" ]; then
+    BACKUP="${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "${CADDYFILE}" "${BACKUP}"
+    ok "backed up existing Caddyfile -> ${BACKUP}"
+  fi
+  cat >> "${CADDYFILE}" <<'CADDY_EOF'
 
-cat > "${CADDYFILE}" <<'CADDY_EOF'
-# Managed by lazydev — all *.localhost names route to the on-demand daemon on
+# Managed by lazydev. All *.localhost names route to the on-demand daemon on
 # :4000, which wakes each project's dev server on first hit and sleeps it when idle.
 http://*.localhost, http://*.*.localhost {
     reverse_proxy localhost:4000
 }
 CADDY_EOF
-
-ok "Caddyfile written"
+  ok "lazydev block appended to Caddyfile"
+fi
 
 # Reload Caddy WITHOUT sudo; fall back to a service restart.
 info "Reloading Caddy"
