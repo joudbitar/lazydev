@@ -400,27 +400,31 @@ async function ensureUp(project) {
     return r;
   }
 
-  // Probe the port (both loopback families). If something is already
-  // listening, adopt it (do NOT spawn) and remember which family answered.
-  const openHost = await probePort(project.port, 300);
-  if (openHost) {
-    r.upstreamHost = openHost;
-    // Is it our own owned child, or an external process?
-    if (r.owned && r.child && r.child.exitCode === null) {
-      r.state = 'running';
-    } else {
-      r.state = 'running';
-      r.owned = false;
-      r.child = null;
-      r.pid = null;
-    }
-    return r;
-  }
-
-  // Need to spawn. Build one shared "bring up" promise. Install (if needed)
-  // and start are ONE atomic operation under a single startPromise, so a
-  // second concurrent request never launches a second install.
+  // Claim the bring-up mutex synchronously — BEFORE any await — so N concurrent
+  // requests to a cold project share ONE promise instead of each spawning its
+  // own dev server (which then collide on the project's fixed port). The port
+  // probe and the adopt-or-spawn decision all live inside this closure; there
+  // must be no `await` between the `r.startPromise` check above and this line.
   r.startPromise = (async () => {
+    // Probe the port (both loopback families). If something is already
+    // listening, adopt it (do NOT spawn) and remember which family answered.
+    const openHost = await probePort(project.port, 300);
+    if (openHost) {
+      r.upstreamHost = openHost;
+      // Is it our own owned child, or an external process?
+      if (r.owned && r.child && r.child.exitCode === null) {
+        r.state = 'running';
+      } else {
+        r.state = 'running';
+        r.owned = false;
+        r.child = null;
+        r.pid = null;
+      }
+      return;
+    }
+
+    // Need to spawn. Install (if needed) and start are ONE atomic operation, so
+    // a second concurrent request never launches a second install.
     // First start with no deps installed -> install them before starting.
     const nodeModules = path.join(project.dir, 'node_modules');
     if (!fs.existsSync(nodeModules)) {

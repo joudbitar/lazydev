@@ -11,9 +11,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 
-DAEMON_PORT=4000
 DAEMON_HOST="lazydev.localhost"
-BASE_URL="http://localhost:${DAEMON_PORT}"
 # Resolve this script's real directory, following the PATH symlink, so the CLI
 # finds its sibling scan.mjs / projects.json / logs wherever the project lives.
 SOURCE="${BASH_SOURCE[0]}"
@@ -30,6 +28,15 @@ SCAN_SCRIPT="${CONFIG_DIR}/scan.mjs"
 PLIST_LABEL="com.lazydev.proxy"
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 NODE="$(command -v node || echo node)"
+
+# The daemon reads its listen port from projects.json (default 4000). Read it
+# from the same place so the CLI follows a custom port instead of assuming 4000.
+DAEMON_PORT=4000
+if [ -f "$PROJECTS_JSON" ]; then
+  _port="$("$NODE" -e 'try{const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).port;if(Number.isFinite(p))process.stdout.write(String(p))}catch{}' "$PROJECTS_JSON" 2>/dev/null)"
+  [ -n "$_port" ] && DAEMON_PORT="$_port"
+fi
+BASE_URL="http://localhost:${DAEMON_PORT}"
 
 # ---------------------------------------------------------------------------
 # Colors (TTY only — no escape codes when piped/redirected)
