@@ -53,7 +53,15 @@ const {
   __addConnForTest,
   __setLastAccessForTest,
   __liveConnInfo,
+  __setResolvePidCwd,
 } = await import('../lazydev.mjs');
+
+// The adopt-path tests here point projects at fake dev servers whose real cwd is
+// the test runner's, not the project dir — which the cwd-verified adoption added
+// later would flag as a port CONFLICT rather than an adopt. Force the PID->cwd
+// resolver to "unresolved" (null) so those adopts degrade to the legacy adopt,
+// the behavior these reaper tests assume. It never fires on spawn-only paths.
+__setResolvePidCwd(() => null);
 
 // --- Helpers -----------------------------------------------------------------
 

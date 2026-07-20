@@ -48,7 +48,16 @@ const {
   ensureUp,
   stop,
   upstreamAgent,
+  __setResolvePidCwd,
 } = await import('../lazydev.mjs');
+
+// These tests adopt fake HTTP servers whose real working directory is the test
+// runner's cwd, not the project dir. Under the cwd-verified adoption added later,
+// that mismatch would be flagged as a port CONFLICT instead of an adopt. Force
+// the PID->cwd resolver to "unresolved" (null) so every adopt here degrades to
+// the legacy unverified adopt — the behavior these cold-start tests were written
+// against. Spawn-path tests never listen first, so the resolver is never hit.
+__setResolvePidCwd(() => null);
 
 // --- helpers ----------------------------------------------------------------
 

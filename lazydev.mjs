@@ -7,7 +7,7 @@
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +43,14 @@ const DEFAULTS = {
 // ::1 (IPv6) first; Next binds 0.0.0.0 (reachable via 127.0.0.1) but Vite binds
 // `localhost` -> ::1 ONLY, so we must try both families everywhere we connect.
 const LOOPBACK_HOSTS = ['127.0.0.1', '::1'];
+
+// How long a cold request waits for bring-up to SETTLE before it stops blocking
+// and hands off to the status page / 503-retry. It covers the fast decisions —
+// adopting an already-listening server, or rejecting a cwd-mismatch port
+// conflict (a local probe + a synchronous lsof) — so those answer on the first
+// hit, while a real spawn+startup (far longer) stays non-blocking. Kept well
+// under the cold-nav responsiveness budget.
+const COLD_SETTLE_GRACE_MS = 120;
 
 const STARTED_AT = Date.now();
 
@@ -112,7 +120,8 @@ function getRuntime(host) {
     // lastError persists on the record after startPromise clears, so the cold
     // status page can read WHY a background bring-up failed (see ensureUp). phase
     // is derived from `state` by phaseLabel(); we keep a slot but state is truth.
-    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null, lastError: null, phase: null };
+    // conflictDir holds the foreign cwd when a port-conflict is detected on adopt.
+    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null, lastError: null, phase: null, conflictDir: null };
     runtime.set(host, r);
   }
   return r;
@@ -309,6 +318,82 @@ async function probePort(port, timeoutMs = 300) {
   }
 }
 
+// Resolve the working directory of the process LISTENing on `port`, via lsof
+// (macOS). Returns the cwd string, or null when it cannot be determined (lsof
+// missing/ENOENT, non-zero exit, timeout, or unparseable output). NEVER throws
+// — a null return means "unknown", and ensureUp degrades to the legacy adopt
+// instead of blocking. Two -F (field) queries: first the listening PID on the
+// port, then that PID's cwd file descriptor.
+function defaultResolvePidCwd(port) {
+  let pid;
+  try {
+    const out = execFileSync('lsof', ['-nP', '-iTCP:' + port, '-sTCP:LISTEN', '-Fpn'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    // -F output is one field per line; a `p<pid>` line starts each process
+    // record. A listener may show multiple fds but the same pid repeats — take
+    // the first.
+    for (const line of out.split('\n')) {
+      if (line[0] === 'p') {
+        pid = line.slice(1).trim();
+        break;
+      }
+    }
+    if (!pid) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    // The `n<path>` line carries the cwd path for the cwd fd.
+    for (const line of out.split('\n')) {
+      if (line[0] === 'n') {
+        const p = line.slice(1).trim();
+        return p || null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Mutable binding so the bundled self-test can swap in a fake resolver (same
+// spirit as LAZYDEV_CONFIG / LAZYDEV_REAP_INTERVAL_MS) and never spawn lsof.
+// ensureUp calls through this binding, so the setter must reassign it in place.
+let resolvePidCwd = defaultResolvePidCwd;
+function __setResolvePidCwd(fn) {
+  resolvePidCwd = typeof fn === 'function' ? fn : defaultResolvePidCwd;
+}
+
+// True if two directory paths refer to the same directory. Resolves both (so
+// trailing-slash / `.` segments don't matter) and, best-effort, dereferences
+// symlinks — lsof reports the real path, but project.dir may be a symlink, so a
+// plain string compare would wrongly flag a legitimate manual server.
+function sameDir(a, b) {
+  if (!a || !b) return false;
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  if (ra === rb) return true;
+  let realA = ra;
+  let realB = rb;
+  try {
+    realA = fs.realpathSync(ra);
+  } catch {
+    /* path may not exist locally (e.g. lsof's view); fall back to resolved */
+  }
+  try {
+    realB = fs.realpathSync(rb);
+  } catch {
+    /* ignore */
+  }
+  return realA === realB;
+}
+
 // Poll until SOME loopback family accepts a connection or we time out. Resolves
 // the host string that worked (so ensureUp can pin state.upstreamHost).
 function waitForPort(port, timeoutMs) {
@@ -471,20 +556,57 @@ async function ensureUp(project) {
     // status page doesn't show stale wording while this one is in flight.
     r.lastError = null;
     // Probe the port (both loopback families). If something is already
-    // listening, adopt it (do NOT spawn) and remember which family answered.
+    // listening, decide whether to adopt it (do NOT spawn) by verifying the
+    // listener's working directory. All of this runs inside the mutex closure.
     const openHost = await probePort(project.port, 300);
     if (openHost) {
-      r.upstreamHost = openHost;
-      // Is it our own owned child, or an external process?
+      // Our own live child re-probed: keep it (no ownership check needed).
       if (r.owned && r.child && r.child.exitCode === null) {
+        r.upstreamHost = openHost;
         r.state = 'running';
-      } else {
+        r.conflictDir = null;
+        return;
+      }
+      // External listener: verify ownership by cwd before adopting. A dev server
+      // you started by hand FROM the project dir is yours (matching cwd); a
+      // stray process squatting the port is not.
+      const cwd = resolvePidCwd(project.port); // null when lsof unavailable/unresolved
+      if (cwd === null) {
+        // Cannot determine cwd (lsof missing, etc.) -> degrade to the legacy
+        // adopt rather than blocking a possibly-legitimate server.
+        log(`adopt: ${host} port ${project.port} busy, cwd unresolved -> adopting (external, unverified)`);
+        r.upstreamHost = openHost;
         r.state = 'running';
         r.owned = false;
         r.child = null;
         r.pid = null;
+        r.conflictDir = null;
+        return;
       }
-      return;
+      if (sameDir(cwd, project.dir)) {
+        log(`adopt: ${host} external listener cwd matches ${project.dir} -> adopting`);
+        r.upstreamHost = openHost;
+        r.state = 'running';
+        r.owned = false;
+        r.child = null;
+        r.pid = null;
+        r.conflictDir = null;
+        return;
+      }
+      // Mismatch: someone else owns this port. Do NOT proxy — surface a visible
+      // conflict and reject so no caller ever pipes a request to the foreigner.
+      log(`conflict: ${host} port ${project.port} held by process in ${cwd} (expected ${project.dir}) -> conflict`);
+      r.state = 'conflict';
+      r.owned = false;
+      r.child = null;
+      r.pid = null;
+      r.upstreamHost = null;
+      r.conflictDir = cwd; // remember foreign cwd for status/dashboard detail
+      const e = new Error('portConflict');
+      e.code = 'PORT_CONFLICT';
+      e.host = host;
+      e.conflictDir = cwd;
+      throw e; // rejects startPromise -> handleRequest/handleUpgrade/up never proxy
     }
 
     // Need to spawn. Install (if needed) and start are ONE atomic operation, so
@@ -797,6 +919,32 @@ function sendRetry(res, project, r) {
   res.end(phaseLabel(r) + '\n');
 }
 
+// Terminal answer for a port CONFLICT: the project's port is held by a foreign
+// process (a dev server started from some OTHER directory). We must never proxy
+// to it and never invite a retry, so this is a hard 502 — NOT the transient 503.
+// A browser navigation gets an HTML explanation; curl/XHR gets a plain 502. The
+// foreign cwd is a filesystem path, so it is shown only to an authorized caller
+// (same-origin + token); an ordinary navigation gets it redacted.
+function sendConflict(req, res, project, r, authorized = false) {
+  const host = project.host;
+  const dir = r && r.conflictDir;
+  if (wantsHtml(req)) {
+    const detail = authorized && dir
+      ? `<p class="muted">Port <code>${project.port}</code> is held by a process running in <code>${esc(dir)}</code>, not <code>${esc(project.dir)}</code>.</p>`
+      : `<p class="muted">Its port is held by another process that lazydev did not start. Stop that process, or point this project at a free port.</p>`;
+    return sendHtml(
+      res,
+      502,
+      `lazydev — ${host} port conflict`,
+      `<h1>${esc(host)} has a port conflict</h1>
+       <p>lazydev refused to proxy: something else is already listening on <code>127.0.0.1:${project.port}</code> and it was not started from this project's directory.</p>
+       ${detail}${dashboardHomeLink()}`
+    );
+  }
+  res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+  res.end('port conflict\n');
+}
+
 // True only for loopback: IPv4 127.0.0.0/8, IPv6 ::1, and IPv4-mapped IPv6 like
 // ::ffff:127.0.0.1. Everything else (LAN IPs, 0.0.0.0, '', undefined) is false.
 // Used to fail-closed on any request that did not arrive on a loopback bind.
@@ -894,6 +1042,8 @@ function liveState(host, project) {
     framework: project.framework || 'node',
     state,
     owned,
+    conflict: state === 'conflict',
+    conflictDir: r ? r.conflictDir || null : null,
     lastAccess: la || null,
     idleForMs: la ? Date.now() - la : null,
     connCount: connCount(host),
@@ -974,6 +1124,9 @@ function stateBadge(state, owned) {
   if (state === 'installing') {
     return '<span style="background:#7c3aed;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">installing</span>';
   }
+  if (state === 'conflict') {
+    return '<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">conflict</span>';
+  }
   return '<span style="background:#64748b;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">sleeping</span>';
 }
 
@@ -1000,10 +1153,14 @@ function dashboardHtml() {
       const sleepBtn = ls.owned && ls.state !== 'stopped'
         ? `<button onclick="sleepHost('${esc(p.host)}')">Sleep</button>`
         : `<button disabled>Sleep</button>`;
+      // On conflict, hovering the state cell explains which foreign cwd holds it.
+      const stateTitle = ls.state === 'conflict' && ls.conflictDir
+        ? ` title="port held by ${esc(ls.conflictDir)}"`
+        : '';
       return `<tr>
         <td><a href="http://${esc(p.host)}.localhost/">http://${esc(p.host)}.localhost</a>${enabledNote}</td>
         <td>${esc(ls.framework)}</td>
-        <td>${stateBadge(ls.state, ls.owned)}</td>
+        <td${stateTitle}>${stateBadge(ls.state, ls.owned)}</td>
         <td>${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
         <td>${ls.connCount}</td>
         <td>${sleepBtn}</td>
@@ -1250,25 +1407,56 @@ async function handleRequest(req, res) {
     return proxyHttp(req, res, project);
   }
 
-  // Cold / bringing-up path: do NOT await ensureUp — answer immediately and let
-  // the client (or the status page's poll) drive the retry.
+  // A prior bring-up found the port held by a foreign process (cwd mismatch).
+  // A conflict is TERMINAL, not transient — never proxy to the foreigner and
+  // never tell the client to retry. Surface it as a 502 straight away.
+  if (r.state === 'conflict') {
+    return sendConflict(req, res, project, r, isControlAuthorized(req));
+  }
+
+  // Cold path.
   //
   // Snapshot the phase + failure reason BEFORE kicking a fresh attempt below,
   // because kicking ensureUp synchronously clears r.lastError (fresh-attempt
   // reset) — so a page rendered off the live record after the kick would never
-  // show the failure that just occurred. The snapshot is what the client sees;
-  // the kick starts a new bring-up behind it so a reload lands on the app.
+  // show the failure that just occurred. The snapshot is what a slow-path client
+  // sees; the kick starts a new bring-up behind it so a reload lands on the app.
   const snapshot = { state: r.state, lastError: r.lastError };
 
   // Kick bring-up in the background exactly once. ensureUp claims r.startPromise
-  // synchronously before any await (the #9cb548a fix), so calling it here and
-  // dropping the promise still yields exactly ONE child for N concurrent hits.
-  // The .catch is MANDATORY: since we no longer await, a start-timeout rejection
-  // would otherwise surface as an unhandledRejection. lastError is recorded
-  // inside ensureUp before it throws, so swallowing the rejection loses nothing.
+  // synchronously before any await (the #9cb548a fix), so kicking it here yields
+  // exactly ONE child for N concurrent hits. The .catch is MANDATORY: a
+  // start-timeout / conflict rejection would otherwise surface as an
+  // unhandledRejection. lastError is recorded inside ensureUp before it throws,
+  // so swallowing the rejection here loses nothing.
   if (!r.startPromise) {
     ensureUp(project).catch(() => {});
   }
+  // Wait only a GRACE window for the attempt to settle — long enough for the
+  // fast decisions (adopt an already-listening server, or reject as a port
+  // conflict: a local probe + a synchronous lsof) but NOT for a real
+  // spawn+startup, which must stay non-blocking (a cold nav answers <200ms,
+  // never ~startTimeout). The timer firing leaves the attempt mid-flight.
+  if (r.startPromise) {
+    await Promise.race([
+      r.startPromise.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, COLD_SETTLE_GRACE_MS)),
+    ]);
+  }
+
+  // Adopt settled within the grace -> the port answered; proxy straight through.
+  if (r.state === 'running' && r.upstreamHost) {
+    lastAccess.set(project.host, Date.now());
+    return proxyHttp(req, res, project);
+  }
+  // Conflict settled within the grace -> terminal 502, never proxy.
+  if (r.state === 'conflict') {
+    return sendConflict(req, res, project, r, isControlAuthorized(req));
+  }
+
+  // Still bringing up (or the fresh attempt already failed): answer immediately
+  // and let the client (or the status page's poll) drive the retry, rendering
+  // from the PRE-KICK snapshot so a reload after a failure shows that failure.
 
   // Navigation (browser) -> self-refreshing status page (200 so the browser
   // renders it and runs the poll script instead of showing its own error UI).
@@ -1617,4 +1805,6 @@ export {
   isSameOrigin,
   isControlAuthorized,
   CONTROL_TOKEN_PATH,
+  sameDir,
+  __setResolvePidCwd,
 };
