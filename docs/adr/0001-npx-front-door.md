@@ -90,9 +90,16 @@ everyone else.
 ## Upgrading from npx to the persistent daemon
 
 The npx run is foreground and dies with the terminal. Turning it into the
-persistent background daemon is one command: `npx lazydev install` (equivalently
-the linked CLI's `lazydev install`). That writes the platform's service unit
-(launchd on macOS, a systemd user unit on Linux), grants :80 where the platform
-needs a capability for it, and starts the daemon so it survives logout and
-reboot. Same daemon, same state directory, same front door. The only thing that
-changes is that it now runs in the background and comes back on its own.
+persistent background daemon is one command from a checkout: `./install.sh`
+(equivalently the linked CLI's `lazydev install`). That writes the platform's
+service unit (launchd on macOS, a systemd user unit on Linux), grants :80 where
+the platform needs a capability for it, and starts the daemon so it survives
+logout and reboot. It reads the same XDG state directory the npx run wrote, so
+the discovered registry carries over. Same daemon, same state directory, same
+front door; the only change is that it now runs in the background and comes back
+on its own.
+
+`npx lazydev install` does not do this itself: it prints the pointer to
+`install.sh` rather than installing a unit, because a published npx run lives in
+an ephemeral npm cache and a service pinned to that path would break when the
+cache is cleared. The persistent daemon is installed from a real checkout.
