@@ -6,7 +6,7 @@
 
 import http from 'node:http';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,7 +92,7 @@ function projectByHost(host) {
 function getRuntime(host) {
   let r = runtime.get(host);
   if (!r) {
-    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null };
+    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null, conflictDir: null };
     runtime.set(host, r);
   }
   return r;
@@ -246,6 +246,82 @@ async function probePort(port, timeoutMs = 300) {
   } catch {
     return null;
   }
+}
+
+// Resolve the working directory of the process LISTENing on `port`, via lsof
+// (macOS). Returns the cwd string, or null when it cannot be determined (lsof
+// missing/ENOENT, non-zero exit, timeout, or unparseable output). NEVER throws
+// — a null return means "unknown", and ensureUp degrades to the legacy adopt
+// instead of blocking. Two -F (field) queries: first the listening PID on the
+// port, then that PID's cwd file descriptor.
+function defaultResolvePidCwd(port) {
+  let pid;
+  try {
+    const out = execFileSync('lsof', ['-nP', '-iTCP:' + port, '-sTCP:LISTEN', '-Fpn'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    // -F output is one field per line; a `p<pid>` line starts each process
+    // record. A listener may show multiple fds but the same pid repeats — take
+    // the first.
+    for (const line of out.split('\n')) {
+      if (line[0] === 'p') {
+        pid = line.slice(1).trim();
+        break;
+      }
+    }
+    if (!pid) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    // The `n<path>` line carries the cwd path for the cwd fd.
+    for (const line of out.split('\n')) {
+      if (line[0] === 'n') {
+        const p = line.slice(1).trim();
+        return p || null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Mutable binding so the bundled self-test can swap in a fake resolver (same
+// spirit as LAZYDEV_CONFIG / LAZYDEV_REAP_INTERVAL_MS) and never spawn lsof.
+// ensureUp calls through this binding, so the setter must reassign it in place.
+let resolvePidCwd = defaultResolvePidCwd;
+function __setResolvePidCwd(fn) {
+  resolvePidCwd = typeof fn === 'function' ? fn : defaultResolvePidCwd;
+}
+
+// True if two directory paths refer to the same directory. Resolves both (so
+// trailing-slash / `.` segments don't matter) and, best-effort, dereferences
+// symlinks — lsof reports the real path, but project.dir may be a symlink, so a
+// plain string compare would wrongly flag a legitimate manual server.
+function sameDir(a, b) {
+  if (!a || !b) return false;
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  if (ra === rb) return true;
+  let realA = ra;
+  let realB = rb;
+  try {
+    realA = fs.realpathSync(ra);
+  } catch {
+    /* path may not exist locally (e.g. lsof's view); fall back to resolved */
+  }
+  try {
+    realB = fs.realpathSync(rb);
+  } catch {
+    /* ignore */
+  }
+  return realA === realB;
 }
 
 // Poll until SOME loopback family accepts a connection or we time out. Resolves
@@ -407,20 +483,57 @@ async function ensureUp(project) {
   // must be no `await` between the `r.startPromise` check above and this line.
   r.startPromise = (async () => {
     // Probe the port (both loopback families). If something is already
-    // listening, adopt it (do NOT spawn) and remember which family answered.
+    // listening, decide whether to adopt it (do NOT spawn) by verifying the
+    // listener's working directory. All of this runs inside the mutex closure.
     const openHost = await probePort(project.port, 300);
     if (openHost) {
-      r.upstreamHost = openHost;
-      // Is it our own owned child, or an external process?
+      // Our own live child re-probed: keep it (no ownership check needed).
       if (r.owned && r.child && r.child.exitCode === null) {
+        r.upstreamHost = openHost;
         r.state = 'running';
-      } else {
+        r.conflictDir = null;
+        return;
+      }
+      // External listener: verify ownership by cwd before adopting. A dev server
+      // you started by hand FROM the project dir is yours (matching cwd); a
+      // stray process squatting the port is not.
+      const cwd = resolvePidCwd(project.port); // null when lsof unavailable/unresolved
+      if (cwd === null) {
+        // Cannot determine cwd (lsof missing, etc.) -> degrade to the legacy
+        // adopt rather than blocking a possibly-legitimate server.
+        log(`adopt: ${host} port ${project.port} busy, cwd unresolved -> adopting (external, unverified)`);
+        r.upstreamHost = openHost;
         r.state = 'running';
         r.owned = false;
         r.child = null;
         r.pid = null;
+        r.conflictDir = null;
+        return;
       }
-      return;
+      if (sameDir(cwd, project.dir)) {
+        log(`adopt: ${host} external listener cwd matches ${project.dir} -> adopting`);
+        r.upstreamHost = openHost;
+        r.state = 'running';
+        r.owned = false;
+        r.child = null;
+        r.pid = null;
+        r.conflictDir = null;
+        return;
+      }
+      // Mismatch: someone else owns this port. Do NOT proxy — surface a visible
+      // conflict and reject so no caller ever pipes a request to the foreigner.
+      log(`conflict: ${host} port ${project.port} held by process in ${cwd} (expected ${project.dir}) -> conflict`);
+      r.state = 'conflict';
+      r.owned = false;
+      r.child = null;
+      r.pid = null;
+      r.upstreamHost = null;
+      r.conflictDir = cwd; // remember foreign cwd for status/dashboard detail
+      const e = new Error('portConflict');
+      e.code = 'PORT_CONFLICT';
+      e.host = host;
+      e.conflictDir = cwd;
+      throw e; // rejects startPromise -> handleRequest/handleUpgrade/up never proxy
     }
 
     // Need to spawn. Install (if needed) and start are ONE atomic operation, so
@@ -666,6 +779,8 @@ function liveState(host, project) {
     framework: project.framework || 'node',
     state,
     owned,
+    conflict: state === 'conflict',
+    conflictDir: r ? r.conflictDir || null : null,
     lastAccess: la || null,
     idleForMs: la ? Date.now() - la : null,
   };
@@ -736,6 +851,9 @@ function stateBadge(state, owned) {
   if (state === 'installing') {
     return '<span style="background:#7c3aed;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">installing</span>';
   }
+  if (state === 'conflict') {
+    return '<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">conflict</span>';
+  }
   return '<span style="background:#64748b;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">sleeping</span>';
 }
 
@@ -757,10 +875,14 @@ function dashboardHtml() {
       const sleepBtn = ls.owned && ls.state !== 'stopped'
         ? `<button onclick="sleepHost('${esc(p.host)}')">Sleep</button>`
         : `<button disabled>Sleep</button>`;
+      // On conflict, hovering the state cell explains which foreign cwd holds it.
+      const stateTitle = ls.state === 'conflict' && ls.conflictDir
+        ? ` title="port held by ${esc(ls.conflictDir)}"`
+        : '';
       return `<tr>
         <td><a href="http://${esc(p.host)}.localhost/">http://${esc(p.host)}.localhost</a>${enabledNote}</td>
         <td>${esc(ls.framework)}</td>
-        <td>${stateBadge(ls.state, ls.owned)}</td>
+        <td${stateTitle}>${stateBadge(ls.state, ls.owned)}</td>
         <td>${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
         <td>${sleepBtn}</td>
       </tr>`;
@@ -1242,4 +1364,4 @@ if (RUN_AS_MAIN) {
 }
 
 // Exported for the bundled self-test (no behavior change for the daemon itself).
-export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress };
+export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress, sameDir, __setResolvePidCwd };

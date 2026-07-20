@@ -113,7 +113,7 @@ cmd_ls() {
 
   STATUS_JSON="$json" \
   C_RESET="$C_RESET" C_DIM="$C_DIM" C_BOLD="$C_BOLD" \
-  C_GREEN="$C_GREEN" C_YELLOW="$C_YELLOW" C_CYAN="$C_CYAN" \
+  C_GREEN="$C_GREEN" C_YELLOW="$C_YELLOW" C_CYAN="$C_CYAN" C_RED="$C_RED" \
   "$NODE" -e '
   (function () {
     const raw = process.env.STATUS_JSON || "{}";
@@ -124,6 +124,7 @@ cmd_ls() {
       green: process.env.C_GREEN || "",
       yellow:process.env.C_YELLOW || "",
       cyan:  process.env.C_CYAN || "",
+      red:   process.env.C_RED || "",
     };
     let s;
     try { s = JSON.parse(raw); } catch (e) {
@@ -196,6 +197,7 @@ cmd_ls() {
       if (!r.enabled) return C.dim + padded + C.reset;
       if (r.state === "running")  return C.green + padded + C.reset;
       if (r.state === "starting") return C.yellow + padded + C.reset;
+      if (r.state === "conflict") return C.red + padded + C.reset;
       // stopped / sleeping
       return C.dim + padded + C.reset;
     }
