@@ -36,7 +36,9 @@ if [ -f "$PROJECTS_JSON" ]; then
   _port="$("$NODE" -e 'try{const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).port;if(Number.isFinite(p))process.stdout.write(String(p))}catch{}' "$PROJECTS_JSON" 2>/dev/null)"
   [ -n "$_port" ] && DAEMON_PORT="$_port"
 fi
-BASE_URL="http://localhost:${DAEMON_PORT}"
+# Daemon binds loopback (127.0.0.1). Hit it by IP, not `localhost`, so we don't
+# eat an IPv6-first (::1) resolution stall on machines where that resolves first.
+BASE_URL="http://127.0.0.1:${DAEMON_PORT}"
 
 # ---------------------------------------------------------------------------
 # Colors (TTY only — no escape codes when piped/redirected)

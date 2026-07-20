@@ -633,6 +633,22 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// True only for loopback: IPv4 127.0.0.0/8, IPv6 ::1, and IPv4-mapped IPv6 like
+// ::ffff:127.0.0.1. Everything else (LAN IPs, 0.0.0.0, '', undefined) is false.
+// Used to fail-closed on any request that did not arrive on a loopback bind.
+function isLoopbackAddress(addr) {
+  if (!addr || typeof addr !== 'string') return false;
+  let a = addr;
+  // Strip an IPv4-mapped IPv6 prefix so ::ffff:127.0.0.1 is judged as 127.0.0.1.
+  const mapped = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) a = mapped[1];
+  if (a === '::1') return true;
+  // IPv4 127.0.0.0/8
+  const m = a.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) return Number(m[1]) === 127;
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Control plane
 // ---------------------------------------------------------------------------
@@ -866,24 +882,56 @@ function proxyHttp(req, res, project) {
 // Request handler
 // ---------------------------------------------------------------------------
 
-const server = http.createServer((req, res) => {
-  try {
-    handleRequest(req, res);
-  } catch (err) {
-    log(`request-handler crash: ${err && err.stack ? err.stack : err}`);
+// Every loopback listener we bind under RUN_AS_MAIN, so shutdown() can close
+// them all (127.0.0.1 primary + ::1 best-effort).
+const daemonServers = [];
+
+// Build a daemon HTTP server: the request try/catch wrapper plus the upgrade
+// (WebSocket/HMR) handler, both fail-closed against non-loopback binds. Called
+// once per loopback listener under RUN_AS_MAIN, and directly by the self-test.
+function createDaemonServer() {
+  const srv = http.createServer((req, res) => {
     try {
-      if (!res.headersSent) {
-        sendHtml(res, 500, 'lazydev — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
-      } else {
-        res.destroy();
+      handleRequest(req, res);
+    } catch (err) {
+      log(`request-handler crash: ${err && err.stack ? err.stack : err}`);
+      try {
+        if (!res.headersSent) {
+          sendHtml(res, 500, 'lazydev — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
+        } else {
+          res.destroy();
+        }
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
     }
-  }
-});
+  });
+
+  srv.on('upgrade', (req, clientSocket, head) => {
+    handleUpgrade(req, clientSocket, head).catch((err) => {
+      log(`upgrade-handler crash: ${err && err.message}`);
+      try {
+        clientSocket.destroy();
+      } catch {
+        /* ignore */
+      }
+    });
+  });
+
+  return srv;
+}
 
 async function handleRequest(req, res) {
+  // Fail-closed: only serve requests that arrived on a loopback address. Even if
+  // a listener ends up bound to a routable interface, a request from off-box is
+  // rejected here rather than reaching the control plane or a dev server.
+  if (!isLoopbackAddress(req.socket && req.socket.localAddress)) {
+    log(`forbidden: non-loopback request on ${req.socket && req.socket.localAddress}`);
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('forbidden\n');
+    return;
+  }
+
   const hostHeader = req.headers.host || '';
   const key = resolveHostKey(hostHeader);
   // Parse URL relative to a dummy base; we only need pathname.
@@ -957,18 +1005,18 @@ async function handleRequest(req, res) {
 // WebSocket / HMR upgrade proxy
 // ---------------------------------------------------------------------------
 
-server.on('upgrade', (req, clientSocket, head) => {
-  handleUpgrade(req, clientSocket, head).catch((err) => {
-    log(`upgrade-handler crash: ${err && err.message}`);
+async function handleUpgrade(req, clientSocket, head) {
+  // Fail-closed: same loopback gate as handleRequest, for WS/HMR upgrades.
+  if (!isLoopbackAddress(clientSocket && clientSocket.localAddress)) {
+    log(`forbidden upgrade: non-loopback on ${clientSocket && clientSocket.localAddress}`);
     try {
       clientSocket.destroy();
     } catch {
       /* ignore */
     }
-  });
-});
+    return;
+  }
 
-async function handleUpgrade(req, clientSocket, head) {
   const hostHeader = req.headers.host || '';
   const key = resolveHostKey(hostHeader);
 
@@ -1133,10 +1181,12 @@ function shutdown(sig) {
   }
   // Give children a moment to exit, then go.
   setTimeout(() => {
-    try {
-      server.close();
-    } catch {
-      /* ignore */
+    for (const srv of daemonServers) {
+      try {
+        srv.close();
+      } catch {
+        /* ignore */
+      }
     }
     process.exit(0);
   }, 500);
@@ -1162,19 +1212,34 @@ if (RUN_AS_MAIN) {
   const REAP_INTERVAL_MS = Number(process.env.LAZYDEV_REAP_INTERVAL_MS) || 30_000;
   setInterval(reapIdle, REAP_INTERVAL_MS).unref?.();
 
-  server.on('error', (err) => {
-    log(`server error: ${err && err.message}`);
+  // Bind loopback only, in two families. 127.0.0.1 is the primary front door
+  // (Caddy proxies here) — a port collision there is fatal. ::1 is best-effort:
+  // some machines have no IPv6 loopback, so a bind failure there must never take
+  // the daemon down. Nothing off this box can reach either address.
+  const primary = createDaemonServer();
+  daemonServers.push(primary);
+  primary.on('error', (err) => {
+    log(`server error (127.0.0.1): ${err && err.message}`);
     if (err && err.code === 'EADDRINUSE') {
-      log(`FATAL: port ${config.port} already in use; exiting`);
+      log(`FATAL: 127.0.0.1:${config.port} already in use; exiting`);
       process.exit(1);
     }
   });
+  primary.listen(config.port, '127.0.0.1', () => {
+    log(`lazydev listening on 127.0.0.1:${config.port} (config=${CONFIG_PATH})`);
+    log(`dashboard: http://lazydev.localhost/  (or http://127.0.0.1:${config.port}/ with Host: lazydev.localhost)`);
+  });
 
-  server.listen(config.port, () => {
-    log(`lazydev listening on :${config.port} (config=${CONFIG_PATH})`);
-    log(`dashboard: http://lazydev.localhost/  (or http://localhost:${config.port}/ with Host: lazydev.localhost)`);
+  const secondary = createDaemonServer();
+  daemonServers.push(secondary);
+  secondary.on('error', (err) => {
+    // Best-effort: never fatal. Keep serving on 127.0.0.1 regardless.
+    log(`note: IPv6 loopback [::1]:${config.port} unavailable (${err && err.code || err && err.message}); serving on 127.0.0.1 only`);
+  });
+  secondary.listen(config.port, '::1', () => {
+    log(`lazydev also listening on [::1]:${config.port}`);
   });
 }
 
 // Exported for the bundled self-test (no behavior change for the daemon itself).
-export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS };
+export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress };
