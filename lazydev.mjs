@@ -65,7 +65,6 @@ function ensureDir(dir) {
     /* ignore */
   }
 }
-ensureDir(LOGS_DIR);
 
 function ts() {
   return new Date().toISOString();
@@ -79,8 +78,11 @@ function log(...parts) {
   } catch {
     /* ignore */
   }
-  // daemon.log (best-effort)
+  // daemon.log (best-effort). Ensure LOGS_DIR here rather than at import so a
+  // bare `import` of this module writes nothing; mkdirSync recursive is
+  // idempotent+cheap, so the running daemon's cost/behavior is unchanged.
   try {
+    ensureDir(LOGS_DIR);
     fs.appendFileSync(DAEMON_LOG, line + '\n');
   } catch {
     /* ignore */
