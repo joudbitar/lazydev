@@ -41,23 +41,39 @@ Hot-module reload works through the proxy; WebSocket connections are piped raw. 
 
 ## run it locally
 
-macOS, Node 20+, and Caddy (`brew install caddy`).
+You need Node 22 and nothing else. One command scans your home directory, wakes the proxy, and prints a URL for every project:
+
+```bash
+npx lazydev
+```
+
+This runs in the foreground and serves the front door itself, so there is no Caddy and no second process. On macOS it binds port 80 directly, so the URLs are the bare `http://<name>.localhost`. On Linux an unprivileged process cannot take port 80, so it falls back to a numbered port and prints URLs with that port, like `http://webapp.localhost:7420`. Ctrl-C stops it.
+
+Everything it writes goes into one state directory (`$XDG_STATE_HOME/lazydev`, or `~/.local/state/lazydev`): the registry, the logs, the control token. Nothing lands in your project folders. Delete that directory and lazydev is gone, since this path installs no service.
+
+Until lazydev is published to npm, run the entrypoint from a checkout, which is the same code path:
 
 ```bash
 git clone https://github.com/joudbitar/lazydev ~/lazydev
-~/lazydev/install.sh
-lazydev scan
+node ~/lazydev/bin/lazydev.mjs
 ```
 
-`install.sh` loads a LaunchAgent for the daemon and adds a three-line wildcard block to your Caddyfile, then reloads both. No sudo anywhere. `uninstall.sh` puts everything back.
+To keep it running after you close the terminal, install it as a background daemon:
+
+```bash
+~/lazydev/install.sh
+```
+
+On macOS `install.sh` loads a LaunchAgent pointed at the same state directory, so your registry carries over and the daemon comes back on reboot. `uninstall.sh` puts everything back. The Linux background service (a systemd user unit) is not written yet, so on Linux the foreground `npx lazydev` run is the whole story for now.
 
 ## how it's built
 
-The daemon is one Node file with zero npm dependencies: router, reverse proxy, process supervisor, and idle reaper in about 1,200 lines of built-ins. Caddy sits in front. launchd keeps it alive. The registry is one JSON file.
+The daemon is one Node file with zero npm dependencies: router, reverse proxy, process supervisor, and idle reaper in about 1,200 lines of built-ins. It serves the front door itself. launchd (or a systemd user unit) keeps it alive. The registry is one JSON file.
 
 The decisions that matter:
 
-- Caddy owns port 80 and forwards every `*.localhost` request to the daemon on 4000. The daemon restarts constantly (registry reloads, upgrades, crashes) and the front door never drops. It also means https is a Caddy config line away instead of a TLS implementation in Node.
+- The daemon owns the front door directly. It parses the Host header, reverse-proxies HTTP, and pipes WebSocket and HMR connections raw, so it binds port 80 itself with no second proxy to install. macOS grants an unprivileged process that bind; Linux does not without `CAP_NET_BIND_SERVICE`, so `npx lazydev` falls back to a numbered port and the background service grants the capability. The cost is that a daemon restart briefly drops the front door with it, and https on `*.localhost` is gone until it is a TLS implementation in Node. See `docs/adr/0001-npx-front-door.md` for why that trade won.
+- Whatever port it lands on, it binds only the loopback families (127.0.0.1 and ::1) and 403s any request that did not arrive on a loopback address, so nothing off the machine can reach a dev server.
 - Dev servers spawn as process-group leaders, so sleeping a project kills the whole tree with one signal: pnpm, the framework under it, its workers. No orphaned process squatting port 3000.
 - `*.localhost` resolves to your own machine by web standard (RFC 6761), so there is nothing to set up: no /etc/hosts edits, no custom DNS resolver, no browser proxy config.
 - Health probes try both loopbacks. On some Macs `localhost` resolves only to `::1`, and plenty of dev servers listen on one family only; probing `127.0.0.1` and `::1` separately is the difference between "it works" and a mystery 502.
@@ -65,8 +81,8 @@ The decisions that matter:
 
 ## what it doesn't do
 
-- Linux. The daemon is portable Node, but the installer is macOS launchd. A systemd port is the PR I'd merge first.
-- https, yet. See the Caddy note above.
+- The persistent Linux service. `npx lazydev` runs on Linux today (it falls back off port 80), but the background install is still macOS launchd only. The systemd user unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE` is the PR I'd merge first.
+- https, yet. Dropping Caddy dropped its one-line TLS with it, and I am not writing a TLS stack in Node. `*.localhost` stays http.
 - Anything except dev servers. Databases, Docker, queues, and tunnels are out of scope. It is also not a production process manager; stopping idle servers is the point here and the opposite of what production wants.
 
 ## alternatives

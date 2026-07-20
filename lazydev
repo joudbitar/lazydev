@@ -397,29 +397,32 @@ cmd_restart() {
 }
 
 # ---------------------------------------------------------------------------
-# status — one-line health for daemon + Caddy
+# status — one-line health for the daemon and its front door
 # ---------------------------------------------------------------------------
 
 cmd_status() {
-  local daemon_state caddy_state
+  local daemon_state front_state
 
   if daemon_up; then
     daemon_state="${C_GREEN}OK${C_RESET}"
   elif port_listening "$DAEMON_PORT"; then
-    # Something's on :4000 but not answering the control API.
+    # Something's on the control port but not answering the control API.
     daemon_state="${C_YELLOW}LISTENING (not responding)${C_RESET}"
   else
     daemon_state="${C_RED}DOWN${C_RESET}"
   fi
 
+  # The daemon serves the front door itself now (no Caddy). Report whether
+  # something holds :80 — the daemon when it could bind it, nothing on a Linux
+  # npx run that fell back to a numbered port.
   if port_listening 80; then
-    caddy_state="${C_GREEN}OK${C_RESET}"
+    front_state="${C_GREEN}OK${C_RESET}"
   else
-    caddy_state="${C_RED}DOWN${C_RESET}"
+    front_state="${C_RED}DOWN${C_RESET}"
   fi
 
-  printf 'daemon (:%s)  %b\n' "$DAEMON_PORT" "$daemon_state"
-  printf 'caddy  (:80)  %b\n' "$caddy_state"
+  printf 'daemon      (:%s)  %b\n' "$DAEMON_PORT" "$daemon_state"
+  printf 'front door  (:80)  %b\n' "$front_state"
 }
 
 # ---------------------------------------------------------------------------
@@ -451,7 +454,7 @@ ${C_BOLD}USAGE${C_RESET}
   lazydev daemon-logs [-f]     Tail the daemon's log (-f to follow)
   lazydev scan                 Rescan ~ for projects, reload registry, list
   lazydev restart              Restart the daemon, wait for it, then list
-  lazydev status               One-line health: daemon (:4000) + Caddy (:80)
+  lazydev status               One-line health: daemon + front door (:80)
   lazydev dash                 Open the daemon's HTML dashboard
   lazydev help                 Show this help
 
