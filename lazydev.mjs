@@ -54,6 +54,47 @@ function ts() {
   return new Date().toISOString();
 }
 
+// Cap a log file at maxBytes, keeping at most `keep` rotated generations
+// (x.log -> x.log.1 -> ... -> x.log.<keep>, pruning older). Best-effort: any
+// fs error is swallowed so logging can never crash the daemon. Called at the
+// ONE place each log is opened for append (daemon.log in log(); per-project
+// logs in logFdFor). Per-project logs are written by the spawned CHILD via the
+// inherited fd, not by the daemon continuously, so rotating at fd-open time
+// (each spawn/install) is the correct single choke point.
+function rotateIfNeeded(file, maxBytes = 1_000_000, keep = 3) {
+  try {
+    let size;
+    try {
+      size = fs.statSync(file).size;
+    } catch {
+      return; // file does not exist yet -> nothing to rotate
+    }
+    if (size < maxBytes) return;
+
+    // Prune the oldest generation, then shift each generation up by one:
+    // x.log.(keep-1) -> x.log.keep, ..., x.log.1 -> x.log.2, x.log -> x.log.1.
+    try {
+      fs.rmSync(`${file}.${keep}`, { force: true });
+    } catch {
+      /* ignore */
+    }
+    for (let i = keep - 1; i >= 1; i--) {
+      try {
+        fs.renameSync(`${file}.${i}`, `${file}.${i + 1}`);
+      } catch {
+        /* generation absent — ignore */
+      }
+    }
+    try {
+      fs.renameSync(file, `${file}.1`);
+    } catch {
+      /* ignore */
+    }
+  } catch {
+    /* never throw into the daemon */
+  }
+}
+
 function log(...parts) {
   const line = `[${ts()}] ${parts.join(' ')}`;
   // stdout
@@ -64,6 +105,7 @@ function log(...parts) {
   }
   // daemon.log (best-effort)
   try {
+    rotateIfNeeded(DAEMON_LOG);
     fs.appendFileSync(DAEMON_LOG, line + '\n');
   } catch {
     /* ignore */
@@ -269,9 +311,17 @@ function waitForPort(port, timeoutMs) {
 // Lifecycle: ensureUp / stop
 // ---------------------------------------------------------------------------
 
+// Open (append) the per-project log fd handed to the spawned child via stdio.
+// This is the SOLE opener of per-project logs — called once per install spawn
+// (runInstall) and once per start spawn (ensureUp). The daemon never appends to
+// this fd itself; the child owns it continuously. So fd-open time is the only
+// choke point the daemon controls: we rotate here, capping the log at each
+// spawn/install. Deliberate limitation: a single long-running dev server whose
+// log grows past 1 MB is only rotated on its NEXT spawn, not mid-run.
 function logFdFor(host) {
   const file = path.join(LOGS_DIR, `${host}.log`);
   try {
+    rotateIfNeeded(file);
     return fs.openSync(file, 'a');
   } catch (err) {
     log(`spawn: cannot open log fd for ${host}: ${err.message}`);
@@ -1242,4 +1292,4 @@ if (RUN_AS_MAIN) {
 }
 
 // Exported for the bundled self-test (no behavior change for the daemon itself).
-export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress };
+export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress, rotateIfNeeded };
