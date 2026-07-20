@@ -6,6 +6,7 @@
 
 import http from 'node:http';
 import net from 'node:net';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,6 +23,13 @@ const CONFIG_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LOGS_DIR = path.join(CONFIG_DIR, 'logs');
 const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
 const CONFIG_PATH = process.env.LAZYDEV_CONFIG || path.join(CONFIG_DIR, 'projects.json');
+
+// The control-plane capability token lives next to the registry, so a test that
+// points LAZYDEV_CONFIG at a temp file also gets an isolated token file there.
+// (CONFIG_DIR is the module's own dir and is NOT overridable; deriving from the
+// config file's directory keeps the real repo's control-token untouched in tests.)
+const STATE_DIR = path.dirname(CONFIG_PATH);
+const CONTROL_TOKEN_PATH = process.env.LAZYDEV_CONTROL_TOKEN_PATH || path.join(STATE_DIR, 'control-token');
 
 const DEFAULTS = {
   port: 4000,
@@ -650,6 +658,70 @@ function isLoopbackAddress(addr) {
 }
 
 // ---------------------------------------------------------------------------
+// Control-plane authorization: capability token + same-origin check
+// ---------------------------------------------------------------------------
+
+// The token authorizes every mutating control action (reload / stop / up) and
+// the log-tail exposure on error pages. It is minted lazily — never at import
+// time — so a bare `import` in a unit test writes nothing to disk unless that
+// test opts in by calling ensureControlToken().
+let CONTROL_TOKEN = null;
+function ensureControlToken() {
+  if (CONTROL_TOKEN) return CONTROL_TOKEN;
+  // Reuse a token already on disk (survives daemon restarts so open CLI/tabs
+  // keep working); otherwise mint one.
+  try {
+    const existing = fs.readFileSync(CONTROL_TOKEN_PATH, 'utf8').trim();
+    if (existing) {
+      CONTROL_TOKEN = existing;
+      return CONTROL_TOKEN;
+    }
+  } catch {
+    /* not present yet */
+  }
+  const tok = crypto.randomBytes(32).toString('hex');
+  try {
+    ensureDir(path.dirname(CONTROL_TOKEN_PATH));
+    fs.writeFileSync(CONTROL_TOKEN_PATH, tok + '\n', { mode: 0o600 });
+    try {
+      fs.chmodSync(CONTROL_TOKEN_PATH, 0o600);
+    } catch {
+      /* ignore */
+    }
+  } catch (err) {
+    log(`control-token: could not persist to ${CONTROL_TOKEN_PATH} (${err.message}); using in-memory token`);
+  }
+  CONTROL_TOKEN = tok;
+  return CONTROL_TOKEN;
+}
+
+// A control request is same-origin when it has NO Origin header (non-browser
+// caller, e.g. the CLI) OR its Origin host matches the daemon's own Host header.
+// A foreign Origin (some other site's page POSTing here) is refused. CSRF only
+// applies to browser-driven cross-site requests; the CLI is not a browser, so
+// the token alone is its proof.
+function isSameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // curl / CLI — no browser Origin to forge
+  let originHost;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  const selfHost = String(req.headers.host || '').toLowerCase();
+  return originHost.toLowerCase() === selfHost;
+}
+
+// Authorized == same-origin AND correct token. Both are required for every
+// mutating control action and for exposing log tails on error pages.
+function isControlAuthorized(req) {
+  if (!isSameOrigin(req)) return false;
+  const tok = req.headers['x-lazydev-token'];
+  return typeof tok === 'string' && tok.length > 0 && tok === ensureControlToken();
+}
+
+// ---------------------------------------------------------------------------
 // Control plane
 // ---------------------------------------------------------------------------
 
@@ -690,6 +762,14 @@ async function handleControl(req, res, url) {
 
   if (method === 'GET' && pathname === '/__lazydev/status') {
     return sendJson(res, 200, statusPayload());
+  }
+
+  // One guard for every mutating control action: reject any POST /__lazydev/*
+  // that is not both same-origin AND carrying the capability token. GET / and
+  // GET /__lazydev/status stay ungated so the CLI's read path and the dashboard
+  // load keep working; neither exposes anything sensitive.
+  if (method === 'POST' && pathname.startsWith('/__lazydev/') && !isControlAuthorized(req)) {
+    return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
   }
 
   if (method === 'POST' && pathname === '/__lazydev/reload') {
@@ -750,6 +830,11 @@ function fmtIdle(ms) {
 }
 
 function dashboardHtml() {
+  // The dashboard is served same-origin, so injecting the control token into its
+  // inline script is safe: the browser's same-origin policy stops other sites
+  // reading this HTML. The Sleep button's fetch sends it back as a header, which
+  // authorizes the stop POST. JSON.stringify quotes/escapes it for JS string use.
+  const token = ensureControlToken();
   const rows = config.projects
     .map((p) => {
       const ls = liveState(p.host, p);
@@ -785,7 +870,10 @@ function dashboardHtml() {
   <script>
     async function sleepHost(h) {
       try {
-        await fetch('/__lazydev/stop/' + encodeURIComponent(h), { method: 'POST' });
+        await fetch('/__lazydev/stop/' + encodeURIComponent(h), {
+          method: 'POST',
+          headers: { 'X-Lazydev-Token': ${JSON.stringify(token)} },
+        });
       } catch (e) {}
       location.reload();
     }
@@ -977,6 +1065,13 @@ async function handleRequest(req, res) {
   try {
     await ensureUp(project);
   } catch (err) {
+    // Log tails (and the raw error message, which can leak filesystem paths) are
+    // shown ONLY to authorized callers. An ordinary browser navigation carries no
+    // token, so it gets a redacted page pointing at `lazydev logs <host>`.
+    const authorized = isControlAuthorized(req);
+    const tail = authorized
+      ? `<p>Last lines of <code>logs/${esc(project.host)}.log</code>:</p><pre>${esc(tailLog(project.host, 40))}</pre>`
+      : `<p class="muted">Log output is hidden. Check it with <code>lazydev logs ${esc(project.host)}</code>.</p>`;
     if (err && err.code === 'START_TIMEOUT') {
       return sendHtml(
         res,
@@ -984,16 +1079,18 @@ async function handleRequest(req, res) {
         'lazydev — start timed out',
         `<h1>${esc(project.host)} failed to start</h1>
          <p>The dev server did not open <code>127.0.0.1:${project.port}</code> within ${Math.round(config.startTimeoutMs / 1000)}s.</p>
-         <p>Last lines of <code>logs/${esc(project.host)}.log</code>:</p>
-         <pre>${esc(tailLog(project.host, 40))}</pre>${dashboardHomeLink()}`
+         ${tail}${dashboardHomeLink()}`
       );
     }
+    const detail = authorized
+      ? `<pre>${esc(String(err && err.message))}</pre>`
+      : `<p class="muted">The dev server failed to start.</p>`;
     return sendHtml(
       res,
       502,
       'lazydev — start error',
-      `<h1>${esc(project.host)} could not start</h1><pre>${esc(String(err && err.message))}</pre>
-       <p>Log tail:</p><pre>${esc(tailLog(project.host, 40))}</pre>${dashboardHomeLink()}`
+      `<h1>${esc(project.host)} could not start</h1>${detail}
+       ${tail}${dashboardHomeLink()}`
     );
   }
 
@@ -1205,6 +1302,9 @@ const RUN_AS_MAIN = process.argv[1] && path.resolve(process.argv[1]) === fileURL
 
 if (RUN_AS_MAIN) {
   loadConfig('boot');
+  // Mint (or reuse) the control token before the first request, so the file
+  // exists for the CLI to read and the dashboard HTML can embed it.
+  ensureControlToken();
   startConfigWatch();
   // Reaper cadence is 30s in production. LAZYDEV_REAP_INTERVAL_MS exists solely so
   // the bundled self-test can exercise the idle reaper quickly (same spirit as the
@@ -1242,4 +1342,4 @@ if (RUN_AS_MAIN) {
 }
 
 // Exported for the bundled self-test (no behavior change for the daemon itself).
-export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress };
+export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress, ensureControlToken, isSameOrigin, isControlAuthorized, CONTROL_TOKEN_PATH };
