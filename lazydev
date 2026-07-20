@@ -40,6 +40,15 @@ fi
 # eat an IPv6-first (::1) resolution stall on machines where that resolves first.
 BASE_URL="http://127.0.0.1:${DAEMON_PORT}"
 
+# Capability token for the control plane. The daemon writes it (mode 0600) next
+# to projects.json at boot; we read it and send it on mutating control requests.
+# tr strips the trailing newline the daemon writes.
+CONTROL_TOKEN_FILE="${CONFIG_DIR}/control-token"
+LAZYDEV_TOKEN=""
+if [ -f "$CONTROL_TOKEN_FILE" ]; then
+  LAZYDEV_TOKEN="$(tr -d '\r\n' < "$CONTROL_TOKEN_FILE" 2>/dev/null || true)"
+fi
+
 # ---------------------------------------------------------------------------
 # Colors (TTY only — no escape codes when piped/redirected)
 # ---------------------------------------------------------------------------
@@ -69,9 +78,14 @@ err()  { printf '%s\n' "$*" >&2; }
 die()  { err "${C_RED}lazydev:${C_RESET} $*"; exit 1; }
 
 # curl against the control API. Args: METHOD PATH. Echoes body; returns curl's exit.
+# Sends the capability token so mutating POSTs (up/stop/reload) are authorized.
+# The CLI sends no Origin header (curl doesn't), so the daemon's same-origin
+# check passes and the token alone authorizes the request.
 api() {
   local method="$1" path="$2"
-  curl -fsS -m 10 -X "$method" -H "Host: ${DAEMON_HOST}" "${BASE_URL}${path}"
+  local hdr=()
+  [ -n "$LAZYDEV_TOKEN" ] && hdr=(-H "X-Lazydev-Token: ${LAZYDEV_TOKEN}")
+  curl -fsS -m 10 -X "$method" -H "Host: ${DAEMON_HOST}" "${hdr[@]}" "${BASE_URL}${path}"
 }
 
 # True if the daemon answers on :4000.

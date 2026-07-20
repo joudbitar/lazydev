@@ -274,8 +274,9 @@ test('failed start surfaces the reason + log tail in the status page', async (t)
   const res = await httpReq('127.0.0.1', port, { host: 'broke.localhost', accept: 'text/html', 'sec-fetch-mode': 'navigate' });
   assert.equal(res.status, 200, 'failure nav -> 200 status page');
   assert.match(res.body, /failed|did not open/i, 'names the failure');
-  // Either real log lines or the sentinel — both prove the tail is rendered.
-  assert.match(res.body, /logs\/broke\.log|no log output captured/i, 'includes log tail');
+  // This nav carries no capability token, so the log tail is redacted (issue-5):
+  // the page points at the CLI instead of leaking log paths/contents.
+  assert.match(res.body, /Log output is hidden/i, 'unauthorized failure page redacts the log tail');
 
   // Settle the re-kicked attempt now (config is still 300ms here) so it times
   // out fast and doesn't run under a later test's larger startTimeout.
