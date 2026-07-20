@@ -16,3 +16,6 @@ daemon.err
 *.bak.*
 
 .DS_Store
+
+# Claude Code worktrees / workflow scratch
+.claude/
