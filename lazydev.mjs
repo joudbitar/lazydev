@@ -28,6 +28,7 @@ const DEFAULTS = {
   idleTimeoutMs: 1_800_000, // 30 min
   startTimeoutMs: 120_000, // 2 min
   installTimeoutMs: 300_000, // 5 min
+  connectionHardCapMs: 7_200_000, // 2h — a connection silent this long stops deferring the reaper
 };
 
 // Loopback families to try, in order. `localhost` on this machine resolves
@@ -84,6 +85,14 @@ let config = { ...DEFAULTS, projects: [] };
 const runtime = new Map();
 // lastAccess[host] = epoch ms of last proxied request
 const lastAccess = new Map();
+// connections[host] = Set of live connection records { lastByteAt }. A record is
+// one proxied keep-alive HTTP socket or one WS/HMR upgrade; `lastByteAt` is the
+// last time a byte crossed in either direction. `set.size` is the live count the
+// user sees; the reaper only counts records whose silence is within the hard cap.
+const connections = new Map();
+// Guard so a keep-alive HTTP socket carrying many requests is counted ONCE (add
+// a record on first request, decrement on socket close), not once per request.
+const CONN_TRACKED = Symbol('lazydevConnTracked');
 
 function projectByHost(host) {
   return config.projects.find((p) => p.host === host);
@@ -96,6 +105,46 @@ function getRuntime(host) {
     runtime.set(host, r);
   }
   return r;
+}
+
+// Lazily create + return the host's live-connection Set (mirrors getRuntime).
+function connSet(host) {
+  let s = connections.get(host);
+  if (!s) {
+    s = new Set();
+    connections.set(host, s);
+  }
+  return s;
+}
+
+// Add a live-connection record; returns it so the caller can bump lastByteAt and
+// later remove it on socket close.
+function addConn(host) {
+  const rec = { lastByteAt: Date.now() };
+  connSet(host).add(rec);
+  return rec;
+}
+
+// Remove a record on socket close. Set.delete is idempotent, so wiring this to
+// both 'close' and 'error' teardown paths cannot double-count.
+function removeConn(host, rec) {
+  connSet(host).delete(rec);
+}
+
+// Total live sockets for the host — what the status/CLI/dashboard display.
+function connCount(host) {
+  return connSet(host).size;
+}
+
+// Records that still DEFER the reaper: those with a byte within the hard cap. A
+// connection silent longer than connectionHardCapMs no longer counts, so an
+// abandoned-but-open tab stops protecting the project from the idle reaper.
+function activeConnCount(host, now) {
+  let n = 0;
+  for (const rec of connSet(host)) {
+    if (now - rec.lastByteAt <= config.connectionHardCapMs) n++;
+  }
+  return n;
 }
 
 function loadConfig(reason) {
@@ -118,6 +167,7 @@ function loadConfig(reason) {
     idleTimeoutMs: Number.isFinite(parsed.idleTimeoutMs) ? parsed.idleTimeoutMs : DEFAULTS.idleTimeoutMs,
     startTimeoutMs: Number.isFinite(parsed.startTimeoutMs) ? parsed.startTimeoutMs : DEFAULTS.startTimeoutMs,
     installTimeoutMs: Number.isFinite(parsed.installTimeoutMs) ? parsed.installTimeoutMs : DEFAULTS.installTimeoutMs,
+    connectionHardCapMs: Number.isFinite(parsed.connectionHardCapMs) ? parsed.connectionHardCapMs : DEFAULTS.connectionHardCapMs,
     projects: Array.isArray(parsed.projects) ? parsed.projects : [],
   };
   config = next;
@@ -668,6 +718,8 @@ function liveState(host, project) {
     owned,
     lastAccess: la || null,
     idleForMs: la ? Date.now() - la : null,
+    connCount: connCount(host),
+    activeConnCount: activeConnCount(host, Date.now()),
   };
 }
 
@@ -762,6 +814,7 @@ function dashboardHtml() {
         <td>${esc(ls.framework)}</td>
         <td>${stateBadge(ls.state, ls.owned)}</td>
         <td>${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
+        <td>${ls.connCount}</td>
         <td>${sleepBtn}</td>
       </tr>`;
     })
@@ -779,8 +832,8 @@ function dashboardHtml() {
     button:not(:disabled):hover { background: #8882; }
   </style>
   <table>
-    <thead><tr><th>Project</th><th>Framework</th><th>State</th><th>Idle</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="5" class="muted">No projects registered.</td></tr>'}</tbody>
+    <thead><tr><th>Project</th><th>Framework</th><th>State</th><th>Idle</th><th>Conn</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="muted">No projects registered.</td></tr>'}</tbody>
   </table>
   <script>
     async function sleepHost(h) {
@@ -817,6 +870,26 @@ const upstreamAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 1000, ma
 function proxyHttp(req, res, project) {
   const host = project.host;
   const r = runtime.get(host);
+
+  // Count the client SOCKET once, not per request: a browser holds a keep-alive
+  // socket open across navigations (often with zero in-flight requests) — those
+  // are exactly the "live tab" sockets the reaper must defer to. Guard with a
+  // symbol so a reused socket doesn't add a second record (only one 'close'
+  // fires, so per-request counting would inflate the count and leak records).
+  const cs = req.socket;
+  if (cs && !cs[CONN_TRACKED]) {
+    cs[CONN_TRACKED] = true;
+    const rec = addConn(host);
+    cs.__lazydevRec = rec;
+    cs.once('close', () => removeConn(host, rec));
+    // A single 'data' listener keeps lastByteAt fresh on real traffic; a truly
+    // silent keep-alive socket ages past the hard cap and stops deferring.
+    cs.on('data', () => {
+      rec.lastByteAt = Date.now();
+    });
+  }
+  if (cs && cs.__lazydevRec) cs.__lazydevRec.lastByteAt = Date.now();
+
   // ensureUp() already probed both loopback families and pinned the one that
   // answered (Vite -> ::1, Next -> 127.0.0.1), so we proxy straight to it — no
   // per-request family race, which lets us pipe the body immediately.
@@ -1084,7 +1157,14 @@ async function handleUpgrade(req, clientSocket, head) {
     return;
   }
 
+  // Count this WS/HMR socket as one live connection. The record is created here,
+  // after the upstream connected, so a failed-connect path above never leaks one.
+  // teardown runs on 'error'/'close'/'end' of either socket; Set.delete is
+  // idempotent, so removeConn is safe to call more than once.
+  const rec = addConn(project.host);
+
   const teardown = () => {
+    removeConn(project.host, rec);
     try {
       clientSocket.destroy();
     } catch {
@@ -1102,8 +1182,14 @@ async function handleUpgrade(req, clientSocket, head) {
     teardown();
   });
   upstream.on('close', teardown);
+  upstream.on('end', teardown);
   clientSocket.on('error', teardown);
   clientSocket.on('close', teardown);
+  // A closed browser tab FIN-half-closes its HMR socket. Because the upstream
+  // pipe keeps the socket's writable side open, 'close' never fires — so without
+  // also tearing down on 'end', the record (and the socket pair) would leak and
+  // the connection would keep deferring the reaper forever. Reap on either FIN.
+  clientSocket.on('end', teardown);
 
   // Socket is already connected — replay the original request line + headers.
   const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
@@ -1118,7 +1204,14 @@ async function handleUpgrade(req, clientSocket, head) {
   clientSocket.pipe(upstream);
   upstream.pipe(clientSocket);
 
-  const bump = () => lastAccess.set(project.host, Date.now());
+  // Bump keeps both the idle clock (lastAccess) and this connection's byte clock
+  // (rec.lastByteAt) fresh, so an actively-used HMR socket keeps deferring the
+  // reaper while a silent one ages past the hard cap.
+  const bump = () => {
+    const t = Date.now();
+    lastAccess.set(project.host, t);
+    rec.lastByteAt = t;
+  };
   clientSocket.on('data', bump);
   upstream.on('data', bump);
 }
@@ -1133,8 +1226,14 @@ function reapIdle() {
     const host = project.host;
     const r = runtime.get(host);
     if (!r) continue;
-    // Only reap things WE started.
+    // Only reap things WE started (adoption sets owned=false), so an external /
+    // adopted dev server is never touched no matter how idle it looks.
     if (r.state !== 'running' || !r.owned) continue;
+    // A live tab or active HMR socket (bytes within the hard cap) defers the
+    // reap. A socket silent past connectionHardCapMs drops out of `active`, so an
+    // abandoned tab stops protecting the project — it does NOT gate byte activity.
+    const active = activeConnCount(host, now);
+    if (active > 0) continue;
     const la = lastAccess.get(host) || 0;
     if (la === 0) continue; // never accessed; leave it
     const idle = now - la;
@@ -1241,5 +1340,52 @@ if (RUN_AS_MAIN) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Self-test accessors
+// ---------------------------------------------------------------------------
+// The bundled node --test suite drives the reaper deterministically without
+// RUN_AS_MAIN (which would listen and set the 30s interval). These expose just
+// enough state to force ownership, inject connection presence, and age the idle
+// clock — the raw Maps stay encapsulated. Prefixed `__` to signal test-only,
+// matching the LAZYDEV_CONFIG / LAZYDEV_REAP_INTERVAL_MS self-test hooks.
+
+// Force runtime fields on a host (e.g. {state:'running', owned:true,
+// upstreamHost:'127.0.0.1'}). Needed because adoption forces owned=false, so a
+// test that must exercise the REAP path cannot get owned=true via a real GET.
+function __setRuntimeForTest(host, patch) {
+  Object.assign(getRuntime(host), patch);
+  return runtime.get(host);
+}
+
+// Inject a live-connection record and return it, so a test can age its
+// lastByteAt into the past to synthesize a "silent past the hard cap" socket.
+function __addConnForTest(host) {
+  return addConn(host);
+}
+
+// Drive the idle clock directly for the pure-reaper unit test.
+function __setLastAccessForTest(host, ms) {
+  lastAccess.set(host, ms);
+}
+
+// Snapshot the connection counters for assertions: total live vs. deferring.
+function __liveConnInfo(host) {
+  return { count: connCount(host), active: activeConnCount(host, Date.now()) };
+}
+
 // Exported for the bundled self-test (no behavior change for the daemon itself).
-export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress };
+export {
+  resolveHostKey,
+  loadConfig,
+  inferInstallCmd,
+  connectLoopback,
+  probePort,
+  LOOPBACK_HOSTS,
+  createDaemonServer,
+  isLoopbackAddress,
+  reapIdle,
+  __setRuntimeForTest,
+  __addConnForTest,
+  __setLastAccessForTest,
+  __liveConnInfo,
+};

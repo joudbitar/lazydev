@@ -169,12 +169,13 @@ cmd_ls() {
       // Stopped is presented to the user as "sleeping".
       const stateLabel = state === "stopped" ? "sleeping" : state;
       const idle  = state === "running" ? humanize(p.idleForMs) : "—";
+      const conn  = (p.connCount ?? 0).toString();
       const port  = (p.port ?? "").toString();
       const enabled = p.enabled !== false;
-      return { host, url, state, stateLabel, idle, port, enabled };
+      return { host, url, state, stateLabel, idle, conn, port, enabled };
     });
 
-    const headers = { host: "HOST", url: "URL", state: "STATE", idle: "IDLE", port: "PORT" };
+    const headers = { host: "HOST", url: "URL", state: "STATE", idle: "IDLE", conn: "CONN", port: "PORT" };
 
     // Column widths = max of header and all cell values (uncolored lengths).
     function w(key, label) {
@@ -184,6 +185,7 @@ cmd_ls() {
     const wUrl   = w("url",   headers.url);
     const wState = w("state", headers.state);
     const wIdle  = w("idle",  headers.idle);
+    const wConn  = w("conn",  headers.conn);
 
     function pad(str, width) {
       str = String(str);
@@ -207,6 +209,7 @@ cmd_ls() {
       pad(headers.url, wUrl) + "  " +
       pad(headers.state, wState) + "  " +
       pad(headers.idle, wIdle) + "  " +
+      pad(headers.conn, wConn) + "  " +
       headers.port +
       C.reset
     );
@@ -219,6 +222,7 @@ cmd_ls() {
         urlCell + "  " +
         colorState(r) + "  " +
         pad(r.idle, wIdle) + "  " +
+        pad(r.conn, wConn) + "  " +
         r.port
       );
     }
