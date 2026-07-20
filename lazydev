@@ -21,17 +21,41 @@ while [ -h "$SOURCE" ]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 CONFIG_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
-LOG_DIR="${CONFIG_DIR}/logs"
-DAEMON_LOG="${LOG_DIR}/daemon.log"
-PROJECTS_JSON="${CONFIG_DIR}/projects.json"
 SCAN_SCRIPT="${CONFIG_DIR}/scan.mjs"
-PLIST_LABEL="com.lazydev.proxy"
-PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
+RENDER_SCRIPT="${CONFIG_DIR}/bin/render-unit.mjs"
 NODE="$(command -v node || echo node)"
 
-# The daemon reads its listen port from projects.json (default 4000). Read it
-# from the same place so the CLI follows a custom port instead of assuming 4000.
-DAEMON_PORT=4000
+# Platform: 'darwin' | 'linux' | 'other', via the same pure decision the
+# installer uses (lib/service.mjs). Service control (restart/stop/install/
+# uninstall) branches on this: launchctl on macOS, systemctl --user on Linux.
+PLATFORM="$("$NODE" "$RENDER_SCRIPT" detect "$(uname -s)" 2>/dev/null || echo other)"
+
+# Resolve the state directory the SAME way the installer and `npx lazydev` do:
+# LAZYDEV_STATE_DIR wins, else the XDG state home (~/.local/state/lazydev). That
+# is where the installed daemon keeps the registry, logs, and control token. If
+# no registry is there yet, fall back to the legacy next-to-script layout, so the
+# CLI still finds a daemon started bare from a checkout (state next to the code).
+STATE_DIR="$("$NODE" -e '
+  import(process.argv[1]).then(({ resolveStateDir }) => {
+    const os = require("os");
+    process.stdout.write(resolveStateDir({ env: process.env, home: os.homedir(), scriptDir: "", preferXdg: true }));
+  }).catch(() => {});
+' "${CONFIG_DIR}/lib/state.mjs" 2>/dev/null)"
+if [ -z "$STATE_DIR" ] || { [ ! -f "${STATE_DIR}/projects.json" ] && [ -f "${CONFIG_DIR}/projects.json" ]; }; then
+  STATE_DIR="${CONFIG_DIR}"
+fi
+LOG_DIR="${STATE_DIR}/logs"
+DAEMON_LOG="${LOG_DIR}/daemon.log"
+PROJECTS_JSON="${STATE_DIR}/projects.json"
+
+PLIST_LABEL="com.lazydev.proxy"
+PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
+
+# The control plane answers on the SAME port the daemon serves the front door on.
+# The persistent install pins that to :80 (LAZYDEV_PORT); a bare or fallback run
+# lands on the registry's top-level port. Read the registry's port, defaulting to
+# 80 (the front-door port) so the CLI follows whatever the daemon actually serves.
+DAEMON_PORT=80
 if [ -f "$PROJECTS_JSON" ]; then
   _port="$("$NODE" -e 'try{const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).port;if(Number.isFinite(p))process.stdout.write(String(p))}catch{}' "$PROJECTS_JSON" 2>/dev/null)"
   [ -n "$_port" ] && DAEMON_PORT="$_port"
@@ -41,9 +65,9 @@ fi
 BASE_URL="http://127.0.0.1:${DAEMON_PORT}"
 
 # Capability token for the control plane. The daemon writes it (mode 0600) next
-# to projects.json at boot; we read it and send it on mutating control requests.
-# tr strips the trailing newline the daemon writes.
-CONTROL_TOKEN_FILE="${CONFIG_DIR}/control-token"
+# to projects.json in the state dir at boot; we read it and send it on mutating
+# control requests. tr strips the trailing newline the daemon writes.
+CONTROL_TOKEN_FILE="${STATE_DIR}/control-token"
 LAZYDEV_TOKEN=""
 if [ -f "$CONTROL_TOKEN_FILE" ]; then
   LAZYDEV_TOKEN="$(tr -d '\r\n' < "$CONTROL_TOKEN_FILE" 2>/dev/null || true)"
@@ -361,28 +385,63 @@ cmd_scan() {
 }
 
 # ---------------------------------------------------------------------------
-# restart — kick the launchd agent and wait for :4000
+# Service control — one place, branches on platform (launchctl vs systemctl)
 # ---------------------------------------------------------------------------
 
-cmd_restart() {
-  local uid; uid="$(id -u)"
-  printf '%sRestarting the lazydev daemon ...%s\n' "$C_DIM" "$C_RESET"
-
-  # Preferred: kickstart -k (kill + relaunch) the gui-domain service.
-  if launchctl kickstart -k "gui/${uid}/${PLIST_LABEL}" >/dev/null 2>&1; then
-    :
-  else
+# Restart the daemon's user service. Returns non-zero if no service is installed.
+service_restart() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    local uid; uid="$(id -u)"
+    # Preferred: kickstart -k (kill + relaunch) the gui-domain service.
+    if launchctl kickstart -k "gui/${uid}/${PLIST_LABEL}" >/dev/null 2>&1; then
+      return 0
+    fi
     # Fallback: unload + load -w the plist.
     if [[ -f "$PLIST_PATH" ]]; then
       launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
-      launchctl load -w "$PLIST_PATH" >/dev/null 2>&1 \
-        || die "could not (re)load ${PLIST_PATH} via launchctl."
+      launchctl load -w "$PLIST_PATH" >/dev/null 2>&1 || return 1
+      return 0
+    fi
+    return 1
+  elif [[ "$PLATFORM" == "linux" ]]; then
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user restart lazydev.service >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+# Stop the daemon's user service (leaves it installed / enabled).
+service_stop_daemon() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    local uid; uid="$(id -u)"
+    launchctl bootout "gui/${uid}/${PLIST_LABEL}" >/dev/null 2>&1 && return 0
+    [[ -f "$PLIST_PATH" ]] && launchctl unload "$PLIST_PATH" >/dev/null 2>&1
+    return $?
+  elif [[ "$PLATFORM" == "linux" ]]; then
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user stop lazydev.service >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# restart — bounce the daemon's user service and wait for the front door
+# ---------------------------------------------------------------------------
+
+cmd_restart() {
+  printf '%sRestarting the lazydev daemon ...%s\n' "$C_DIM" "$C_RESET"
+
+  if ! service_restart; then
+    if [[ "$PLATFORM" == "linux" ]]; then
+      die "no lazydev.service found; run the installer (install.sh) first."
     else
       die "no LaunchAgent at ${PLIST_PATH}; run the installer (install.sh) first."
     fi
   fi
 
-  # Wait up to ~15s for :4000 to answer.
+  # Wait up to ~15s for the control port to answer.
   local i
   for i in $(seq 1 30); do
     if daemon_up; then
@@ -397,32 +456,67 @@ cmd_restart() {
 }
 
 # ---------------------------------------------------------------------------
-# status — one-line health for the daemon and its front door
+# install / uninstall — run the persistent-daemon (un)installer for this project
 # ---------------------------------------------------------------------------
 
-cmd_status() {
-  local daemon_state front_state
+cmd_install() {
+  local script="${CONFIG_DIR}/install.sh"
+  [[ -f "$script" ]] || die "installer not found at ${script}"
+  exec bash "$script" "$@"
+}
 
+cmd_uninstall() {
+  local script="${CONFIG_DIR}/uninstall.sh"
+  [[ -f "$script" ]] || die "uninstaller not found at ${script}"
+  exec bash "$script" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# status — health for the daemon (which IS the front door) and its user service
+# ---------------------------------------------------------------------------
+
+# Report whether the user service is registered with the init system. Echoes a
+# short state string; no daemon calls, just the launchd/systemd view.
+service_state() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    local uid; uid="$(id -u)"
+    if launchctl print "gui/${uid}/${PLIST_LABEL}" >/dev/null 2>&1; then
+      printf '%sloaded (launchd)%s' "$C_GREEN" "$C_RESET"
+    elif [[ -f "$PLIST_PATH" ]]; then
+      printf '%sinstalled, not loaded%s' "$C_YELLOW" "$C_RESET"
+    else
+      printf '%snot installed%s' "$C_DIM" "$C_RESET"
+    fi
+  elif [[ "$PLATFORM" == "linux" ]]; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active lazydev.service >/dev/null 2>&1; then
+      printf '%sactive (systemd)%s' "$C_GREEN" "$C_RESET"
+    elif command -v systemctl >/dev/null 2>&1 && systemctl --user list-unit-files lazydev.service >/dev/null 2>&1 \
+      && systemctl --user cat lazydev.service >/dev/null 2>&1; then
+      printf '%sinstalled, not active%s' "$C_YELLOW" "$C_RESET"
+    else
+      printf '%snot installed%s' "$C_DIM" "$C_RESET"
+    fi
+  else
+    printf '%sn/a%s' "$C_DIM" "$C_RESET"
+  fi
+}
+
+cmd_status() {
+  local daemon_state
+
+  # The daemon serves the front door directly (no Caddy). The control API and the
+  # front door are the same listener on the same port, so one probe covers both.
   if daemon_up; then
     daemon_state="${C_GREEN}OK${C_RESET}"
   elif port_listening "$DAEMON_PORT"; then
-    # Something's on the control port but not answering the control API.
+    # Something's on the port but not answering the control API.
     daemon_state="${C_YELLOW}LISTENING (not responding)${C_RESET}"
   else
     daemon_state="${C_RED}DOWN${C_RESET}"
   fi
 
-  # The daemon serves the front door itself now (no Caddy). Report whether
-  # something holds :80 — the daemon when it could bind it, nothing on a Linux
-  # npx run that fell back to a numbered port.
-  if port_listening 80; then
-    front_state="${C_GREEN}OK${C_RESET}"
-  else
-    front_state="${C_RED}DOWN${C_RESET}"
-  fi
-
-  printf 'daemon      (:%s)  %b\n' "$DAEMON_PORT" "$daemon_state"
-  printf 'front door  (:80)  %b\n' "$front_state"
+  printf 'daemon / front door  (:%s)  %b\n' "$DAEMON_PORT" "$daemon_state"
+  printf 'user service               %b\n' "$(service_state)"
 }
 
 # ---------------------------------------------------------------------------
@@ -454,7 +548,9 @@ ${C_BOLD}USAGE${C_RESET}
   lazydev daemon-logs [-f]     Tail the daemon's log (-f to follow)
   lazydev scan                 Rescan ~ for projects, reload registry, list
   lazydev restart              Restart the daemon, wait for it, then list
-  lazydev status               One-line health: daemon + front door (:80)
+  lazydev status               Health: daemon (front door) + user service
+  lazydev install              Install the persistent background daemon
+  lazydev uninstall            Remove the persistent background daemon
   lazydev dash                 Open the daemon's HTML dashboard
   lazydev help                 Show this help
 
@@ -486,6 +582,8 @@ main() {
     scan)              cmd_scan "$@" ;;
     restart)           cmd_restart "$@" ;;
     status)            cmd_status "$@" ;;
+    install)           cmd_install "$@" ;;
+    uninstall)         cmd_uninstall "$@" ;;
     dash)              cmd_dash "$@" ;;
     help|-h|--help)    cmd_help ;;
     *)

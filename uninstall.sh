@@ -1,59 +1,112 @@
 #!/usr/bin/env bash
-# uninstall.sh — reverse install.sh.
+# uninstall.sh — reverse install.sh, cross-platform.
 #
-# Idempotent: boots out the LaunchAgent, removes the plist, restores the most
-# recent Caddyfile backup (or writes a minimal passthrough), and reloads Caddy.
-# Leaves all project code (daemon, registry, scripts) in place.
+# On macOS it boots out and removes the LaunchAgent plist; on Linux it stops,
+# disables, and removes the systemd user unit. It also removes the `lazydev`
+# CLI symlink, and — best effort — strips any legacy lazydev block an OLD Caddy
+# based installer may have left in the system Caddyfile, so users upgrading from
+# the Caddy topology end up clean. It does NOT delete the state directory; it
+# prints the path so you can remove it yourself to erase every trace.
+#
+# Idempotent: safe to run repeatedly. Leaves all project code (daemon, scripts)
+# in place.
 
 set -euo pipefail
 
 HOME_DIR="${HOME}"
 CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-LABEL="com.lazydev.proxy"
-PLIST="${HOME_DIR}/Library/LaunchAgents/${LABEL}.plist"
-
-CADDY_BIN="$(command -v caddy || echo /opt/homebrew/bin/caddy)"
-BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
-CADDYFILE="${BREW_PREFIX:-/opt/homebrew}/etc/Caddyfile"
+RENDER="${CONFIG_DIR}/bin/render-unit.mjs"
+NODE_BIN="$(command -v node || true)"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m  !\033[0m %s\n' "$*"; }
 
 # --------------------------------------------------------------------------
-# 1. Stop + unload the LaunchAgent
+# 0. Detect platform (fall back to uname if node is somehow missing)
 # --------------------------------------------------------------------------
 
-info "Stopping LaunchAgent ${LABEL}"
-
-UID_NUM="$(id -u)"
-DOMAIN="gui/${UID_NUM}"
-
-if launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null; then
-  ok "booted out ${DOMAIN}/${LABEL}"
+if [ -n "${NODE_BIN}" ] && [ -f "${RENDER}" ]; then
+  PLATFORM="$("${NODE_BIN}" "${RENDER}" detect "$(uname -s)")"
 else
-  # Fall back to legacy unload (covers daemons loaded the old way).
-  if [ -f "${PLIST}" ] && launchctl unload "${PLIST}" 2>/dev/null; then
-    ok "unloaded ${PLIST} (legacy)"
+  case "$(uname -s)" in
+    Darwin) PLATFORM=darwin ;;
+    Linux)  PLATFORM=linux ;;
+    *)      PLATFORM=other ;;
+  esac
+fi
+
+# Resolve the SAME state dir the installer used (for the closing hint only).
+STATE_DIR=""
+if [ -n "${NODE_BIN}" ] && [ -f "${CONFIG_DIR}/lib/state.mjs" ]; then
+  STATE_DIR="$(cd "${CONFIG_DIR}" && "${NODE_BIN}" -e '
+    import("./lib/state.mjs").then(({ resolveStateDir }) => {
+      const os = require("os");
+      process.stdout.write(resolveStateDir({ env: process.env, home: os.homedir(), scriptDir: process.cwd(), preferXdg: true }));
+    });
+  ' 2>/dev/null)"
+fi
+
+# --------------------------------------------------------------------------
+# 1. Stop + remove the platform service unit
+# --------------------------------------------------------------------------
+
+remove_macos() {
+  local label plist uid domain
+  label="com.lazydev.proxy"
+  plist="$("${NODE_BIN}" "${RENDER}" path darwin "${HOME_DIR}" "${XDG_CONFIG_HOME:-}" 2>/dev/null || echo "${HOME_DIR}/Library/LaunchAgents/${label}.plist")"
+  uid="$(id -u)"
+  domain="gui/${uid}"
+
+  info "Stopping LaunchAgent ${label}"
+  if launchctl bootout "${domain}/${label}" 2>/dev/null; then
+    ok "booted out ${domain}/${label}"
+  elif [ -f "${plist}" ] && launchctl unload "${plist}" 2>/dev/null; then
+    ok "unloaded ${plist} (legacy)"
   else
     warn "no running LaunchAgent to stop (already gone)"
   fi
-fi
+
+  if [ -f "${plist}" ]; then
+    rm -f "${plist}"
+    ok "removed plist ${plist}"
+  else
+    warn "plist already absent (${plist})"
+  fi
+}
+
+remove_linux() {
+  local unit
+  unit="$("${NODE_BIN}" "${RENDER}" path linux "${HOME_DIR}" "${XDG_CONFIG_HOME:-}" 2>/dev/null || echo "${HOME_DIR}/.config/systemd/user/lazydev.service")"
+
+  info "Stopping + disabling systemd user unit lazydev.service"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now lazydev.service >/dev/null 2>&1 && ok "disabled + stopped lazydev.service" \
+      || warn "lazydev.service was not active (already gone)"
+  else
+    warn "systemctl not found; skipping service stop"
+  fi
+
+  if [ -f "${unit}" ]; then
+    rm -f "${unit}"
+    ok "removed unit ${unit}"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      systemctl --user reset-failed lazydev.service >/dev/null 2>&1 || true
+    fi
+  else
+    warn "unit already absent (${unit})"
+  fi
+}
+
+case "${PLATFORM}" in
+  darwin) remove_macos ;;
+  linux)  remove_linux ;;
+  *)      warn "unrecognized platform '$(uname -s)'; skipping service removal" ;;
+esac
 
 # --------------------------------------------------------------------------
-# 2. Remove the plist
-# --------------------------------------------------------------------------
-
-if [ -f "${PLIST}" ]; then
-  rm -f "${PLIST}"
-  ok "removed plist ${PLIST}"
-else
-  warn "plist already absent (${PLIST})"
-fi
-
-# --------------------------------------------------------------------------
-# 2b. Remove the CLI symlink (only if it points into this project)
+# 2. Remove the CLI symlink (only if it points into this project)
 # --------------------------------------------------------------------------
 
 CLI_LINK="${HOME_DIR}/.local/bin/lazydev"
@@ -63,58 +116,56 @@ if [ -L "${CLI_LINK}" ] && [ "$(readlink "${CLI_LINK}")" = "${CONFIG_DIR}/lazyde
 fi
 
 # --------------------------------------------------------------------------
-# 3. Remove the lazydev block from the Caddyfile (leave other sites intact)
+# 3. Best-effort: strip a legacy Caddy block left by the OLD (Caddy) installer
 # --------------------------------------------------------------------------
 
-info "Removing lazydev block from Caddyfile"
+# Older lazydev installed a wildcard *.localhost block into the system Caddyfile
+# and ran Caddy on :80. The daemon is the front door now (no Caddy), so remove
+# that block if it is still there, leaving any other Caddy sites intact. This is
+# entirely best-effort: no Caddy, no Caddyfile, or no lazydev block -> nothing.
+CADDY_BIN="$(command -v caddy || true)"
+BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+CADDYFILE="${BREW_PREFIX:-/opt/homebrew}/etc/Caddyfile"
 
-if [ -f "${CADDYFILE}" ] && grep -q "Managed by lazydev" "${CADDYFILE}"; then
-  cp "${CADDYFILE}" "${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)"
-  # Drop the two comment lines, the "http://*.localhost ... {" opener, its
-  # reverse_proxy line, and the closing brace — the exact block install appended.
-  node -e '
-    const fs = require("fs");
-    const f = process.argv[1];
-    const lines = fs.readFileSync(f, "utf8").split("\n");
-    const out = [];
-    let skip = 0;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].includes("Managed by lazydev")) { skip = 1; continue; }
-      if (skip && lines[i].includes("*.localhost") && lines[i].includes("{")) { skip = 2; continue; }
-      if (skip === 2) { if (lines[i].trim() === "}") skip = 0; continue; }
-      if (skip === 1) { if (lines[i].trim().startsWith("#") || lines[i].trim() === "") continue; skip = 0; }
-      out.push(lines[i]);
-    }
-    fs.writeFileSync(f, out.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, ""));
-  ' "${CADDYFILE}"
-  ok "removed lazydev block (backup alongside)"
-else
-  warn "no lazydev block found in Caddyfile (already gone)"
-fi
-
-# --------------------------------------------------------------------------
-# 4. Reload Caddy
-# --------------------------------------------------------------------------
-
-info "Reloading Caddy"
-if "${CADDY_BIN}" reload --config "${CADDYFILE}" 2>/dev/null; then
-  ok "caddy reload succeeded"
-else
-  warn "caddy reload failed; restarting brew service"
-  if brew services restart caddy >/dev/null 2>&1; then
-    ok "brew services restart caddy succeeded"
+if [ -n "${NODE_BIN}" ] && [ -f "${CADDYFILE}" ] && grep -q "Managed by lazydev" "${CADDYFILE}" 2>/dev/null; then
+  info "Removing legacy lazydev block from ${CADDYFILE}"
+  cp "${CADDYFILE}" "${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  # Drop both the sentinel-marked block and the older comment-through-brace form.
+  TMP_CADDY="${CADDYFILE}.lazydev.tmp.$$"
+  if awk '
+    /^# >>> lazydev managed block >>>/ { inmarker=1; next }
+    inmarker { if (/^# <<< lazydev managed block <<</) inmarker=0; next }
+    /^# Managed by lazydev/ { inlegacy=1; next }
+    inlegacy { if (/^}/) inlegacy=0; next }
+    { print }
+  ' "${CADDYFILE}" > "${TMP_CADDY}" 2>/dev/null; then
+    mv "${TMP_CADDY}" "${CADDYFILE}"
+    ok "removed legacy lazydev Caddy block (backup alongside)"
+    # Reload Caddy so it drops :80; ignore failures (Caddy may not be running).
+    if [ -n "${CADDY_BIN}" ]; then
+      "${CADDY_BIN}" reload --config "${CADDYFILE}" >/dev/null 2>&1 \
+        || brew services restart caddy >/dev/null 2>&1 || true
+    fi
   else
-    warn "could not reload or restart caddy automatically"
+    rm -f "${TMP_CADDY}" 2>/dev/null || true
+    warn "could not rewrite the Caddyfile; leaving it untouched"
   fi
 fi
 
 # --------------------------------------------------------------------------
-# 5. Summary
+# 4. Summary
 # --------------------------------------------------------------------------
 
 echo
 info "lazydev uninstall summary"
-ok "LaunchAgent stopped + plist removed"
-ok "Caddyfile restored (config code under ${CONFIG_DIR} left intact)"
+ok "user service stopped + unit removed"
+ok "CLI symlink removed (project code under ${CONFIG_DIR} left intact)"
+echo
+if [ -n "${STATE_DIR}" ]; then
+  info "State (registry, logs, control token) is still at:"
+  printf '      %s\n' "${STATE_DIR}"
+  info "Delete that directory to remove every trace:"
+  printf '      rm -rf %s\n' "${STATE_DIR}"
+fi
 echo
 ok "Done. The lazydev daemon will no longer start on boot."

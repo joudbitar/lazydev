@@ -7,8 +7,7 @@ story is in [README.md](README.md); this is the internals.
 
 ```
 browser  ->  http://<host>.localhost            (e.g. http://webapp.localhost)
-         ->  Caddy on :80   (wildcard *.localhost -> localhost:4000)
-         ->  lazydev daemon on :4000
+         ->  lazydev daemon on :80
                - parse Host header -> project
                - ensure that project's dev server is running (start if cold)
                - reverse-proxy the request (HTTP + WebSocket/HMR) to its port
@@ -16,23 +15,45 @@ browser  ->  http://<host>.localhost            (e.g. http://webapp.localhost)
          ->  the project's dev server on its own fixed port (e.g. :3000)
 ```
 
-Caddy owns port 80 and forwards every `*.localhost` request to the daemon. The
-daemon is the brain: it maps hostnames to projects, starts and stops dev servers
-on demand, proxies traffic, and reaps idle projects. Each dev server runs on its
-own fixed port. The daemon has zero npm dependencies, Node built-ins only.
+The daemon serves the front door itself on port 80. There is no Caddy and no
+second proxy: the daemon terminates :80, maps hostnames to projects, starts and
+stops dev servers on demand, proxies HTTP and WebSocket/HMR traffic, and reaps
+idle projects. Each dev server runs on its own fixed port. The daemon has zero
+npm dependencies, Node built-ins only. See
+[docs/adr/0001-npx-front-door.md](docs/adr/0001-npx-front-door.md) for why the
+daemon owns the front door directly.
+
+Binding :80 is not uniform across platforms. macOS lets an unprivileged process
+bind it. Linux does not without `CAP_NET_BIND_SERVICE`, so a plain `npx lazydev`
+on Linux falls back to a numbered port and prints URLs with the port included
+(`http://webapp.localhost:7420`); the persistent Linux service (a systemd user
+unit) grants the capability so it binds :80. Whatever port it lands on, the
+daemon binds only the loopback families (127.0.0.1 and ::1) and 403s any request
+that did not arrive on a loopback address.
 
 ## files
 
 | File | Purpose |
 |------|---------|
 | `lazydev.mjs` | the proxy + lifecycle daemon (Node ESM, zero deps) |
-| `scan.mjs` | scans `$HOME` for projects, writes and merges `projects.json` |
+| `bin/lazydev.mjs` | the `npx lazydev` entrypoint: scan + foreground daemon on the front door |
+| `bin/render-unit.mjs` | renders the platform service unit (calls `lib/service.mjs`) for the installer |
+| `scan.mjs` | scans `$HOME` for projects, writes and merges the registry |
+| `lib/state.mjs` | pure: resolves the one state directory and the paths under it |
+| `lib/bind.mjs` | pure: the :80 -> numbered-port fallback decision and URL formatting |
+| `lib/service.mjs` | pure: platform detection, unit paths, launchd plist + systemd unit renderers |
+| `lib/registry.mjs` | pure: the scan merge logic |
 | `projects.json` | the registry (gitignored; see `projects.example.json`) |
 | `lazydev` | the CLI (bash) |
-| `install.sh` | writes the launchd plist and Caddyfile block, loads both |
-| `uninstall.sh` | reverses the installer |
+| `install.sh` | detects the platform and writes the launchd plist (macOS) or systemd user unit (Linux), then loads it |
+| `uninstall.sh` | reverses the installer on either platform |
 | `serve_static.py` | optional static server with cleanUrls, for static sites |
 | `logs/` | runtime: `daemon.log` plus `<host>.log` per project |
+
+The registry, logs, and control token live in one state directory, not next to
+the code. `npx lazydev` and the persistent install both resolve it to
+`$XDG_STATE_HOME/lazydev` (or `~/.local/state/lazydev`), or to `LAZYDEV_STATE_DIR`
+if you set it, so a foreground run and an installed service share one layout.
 
 ## registry schema
 
@@ -83,7 +104,33 @@ Given the incoming `Host` header:
    - `tenant.webapp.localhost` also resolves to `webapp`, and the original Host header is preserved upstream so the app's own multi-tenant logic still sees `tenant`
 3. Look up an enabled project whose `host` equals that key. A miss returns a friendly page listing the available `*.localhost` URLs.
 
-That last-label rule is why the Caddyfile matches both `*.localhost` and `*.*.localhost`.
+The daemon does this last-label match itself for both `*.localhost` and
+`*.*.localhost` on every request, since it is the front door now.
+
+## `*.localhost` resolution on Linux
+
+`*.localhost` is loopback by web standard (RFC 6761), and browsers resolve it on
+their own with no setup: no `/etc/hosts` edits, no custom resolver. That covers
+the normal case, since lazydev is a browser tool.
+
+Command-line tools are a different story on Linux. Many glibc distributions
+resolve bare `localhost` but not arbitrary `*.localhost` subdomains through the
+system resolver, so `curl http://webapp.localhost/` can fail to resolve there
+even though the browser is fine. Point curl at loopback explicitly with
+`--resolve`:
+
+```bash
+curl --resolve webapp.localhost:80:127.0.0.1 http://webapp.localhost/
+```
+
+On a fallback port (Linux `npx lazydev` without the :80 capability), use that
+port on both sides:
+
+```bash
+curl --resolve webapp.localhost:7420:127.0.0.1 http://webapp.localhost:7420/
+```
+
+macOS resolves `*.localhost` for CLI tools too, so this only comes up on Linux.
 
 ## lifecycle notes
 

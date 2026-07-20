@@ -64,7 +64,15 @@ To keep it running after you close the terminal, install it as a background daem
 ~/lazydev/install.sh
 ```
 
-On macOS `install.sh` loads a LaunchAgent pointed at the same state directory, so your registry carries over and the daemon comes back on reboot. `uninstall.sh` puts everything back. The Linux background service (a systemd user unit) is not written yet, so on Linux the foreground `npx lazydev` run is the whole story for now.
+The installer detects your platform. On macOS it loads a LaunchAgent; on Linux it writes a systemd user unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE` so the daemon can bind :80 as your own user, then `systemctl --user enable --now` starts it. Both point at the same state directory `npx lazydev` used, so your registry carries over, and both come back on reboot. `lazydev install` and `lazydev uninstall` do the same thing from the linked CLI, and `uninstall.sh` puts everything back. On Linux the installer also enables lingering (`loginctl enable-linger`) so the daemon survives logout; if it cannot, it prints the one command to run.
+
+One Linux wrinkle: browsers resolve `*.localhost` to loopback on their own, but glibc command-line tools on many distributions do not resolve arbitrary `*.localhost` subdomains. Point curl at loopback when you test from the terminal:
+
+```bash
+curl --resolve webapp.localhost:80:127.0.0.1 http://webapp.localhost/
+```
+
+If the daemon fell back to a numbered port, use that port on both sides (`--resolve webapp.localhost:7420:127.0.0.1 http://webapp.localhost:7420/`). macOS resolves `*.localhost` for CLI tools too, so this is Linux only.
 
 ## how it's built
 
@@ -81,7 +89,6 @@ The decisions that matter:
 
 ## what it doesn't do
 
-- The persistent Linux service. `npx lazydev` runs on Linux today (it falls back off port 80), but the background install is still macOS launchd only. The systemd user unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE` is the PR I'd merge first.
 - https, yet. Dropping Caddy dropped its one-line TLS with it, and I am not writing a TLS stack in Node. `*.localhost` stays http.
 - Anything except dev servers. Databases, Docker, queues, and tunnels are out of scope. It is also not a production process manager; stopping idle servers is the point here and the opposite of what production wants.
 
