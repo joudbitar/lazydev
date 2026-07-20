@@ -211,25 +211,40 @@ info "Installing wildcard Caddyfile block -> ${CADDYFILE}"
 
 mkdir -p "$(dirname "${CADDYFILE}")"
 
-# Append the lazydev block if it isn't there yet; never clobber other sites.
-if [ -f "${CADDYFILE}" ] && grep -q "Managed by lazydev" "${CADDYFILE}"; then
-  ok "Caddyfile already has the lazydev block"
-else
-  if [ -f "${CADDYFILE}" ]; then
-    BACKUP="${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "${CADDYFILE}" "${BACKUP}"
-    ok "backed up existing Caddyfile -> ${BACKUP}"
-  fi
-  cat >> "${CADDYFILE}" <<'CADDY_EOF'
+# Re-running the installer must FIX an existing install, so strip any prior
+# lazydev-managed block before appending a fresh one — both the current sentinel
+# form (between the >>> and <<< markers) and the legacy form (a `# Managed by
+# lazydev` comment line through the following closing `}`). Back up first.
+if [ -f "${CADDYFILE}" ]; then
+  BACKUP="${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "${CADDYFILE}" "${BACKUP}"
+  ok "backed up existing Caddyfile -> ${BACKUP}"
 
-# Managed by lazydev. All *.localhost names route to the on-demand daemon on
-# :4000, which wakes each project's dev server on first hit and sleeps it when idle.
-http://*.localhost, http://*.*.localhost {
-    reverse_proxy localhost:4000
-}
-CADDY_EOF
-  ok "lazydev block appended to Caddyfile"
+  # awk pass: drop lines inside a sentinel-marked block, and drop a legacy block
+  # from its `# Managed by lazydev` comment through the next closing `}`.
+  TMP_CADDY="${CADDYFILE}.lazydev.tmp.$$"
+  awk '
+    /^# >>> lazydev managed block >>>/ { inmarker=1; next }
+    inmarker { if (/^# <<< lazydev managed block <<</) inmarker=0; next }
+    /^# Managed by lazydev/ { inlegacy=1; next }
+    inlegacy { if (/^}/) inlegacy=0; next }
+    { print }
+  ' "${CADDYFILE}" > "${TMP_CADDY}"
+  mv "${TMP_CADDY}" "${CADDYFILE}"
 fi
+
+# Append the fresh, loopback-bound block wrapped in sentinel markers.
+cat >> "${CADDYFILE}" <<'CADDY_EOF'
+# >>> lazydev managed block >>>
+# Managed by lazydev. *.localhost routes to the on-demand daemon on 127.0.0.1:4000.
+# Bound to loopback so nothing off this machine can reach the daemon or dev servers.
+http://*.localhost, http://*.*.localhost {
+    bind 127.0.0.1 ::1
+    reverse_proxy 127.0.0.1:4000
+}
+# <<< lazydev managed block <<<
+CADDY_EOF
+ok "lazydev block written to Caddyfile"
 
 # Reload Caddy WITHOUT sudo; fall back to a service restart.
 info "Reloading Caddy"

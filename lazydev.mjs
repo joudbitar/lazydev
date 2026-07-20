@@ -6,7 +6,8 @@
 
 import http from 'node:http';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,21 +20,40 @@ import { fileURLToPath } from 'node:url';
 // relocatable: move or clone it anywhere and the registry, logs, and daemon
 // travel together. (Was hardcoded to ~/.config/lazydev before centralizing.)
 const CONFIG_DIR = path.dirname(fileURLToPath(import.meta.url));
-const LOGS_DIR = path.join(CONFIG_DIR, 'logs');
+// LAZYDEV_LOGS_DIR override exists solely so the bundled self-test can point the
+// daemon's log + per-project log files at a temp dir (same spirit as
+// LAZYDEV_CONFIG). Production never sets it.
+const LOGS_DIR = process.env.LAZYDEV_LOGS_DIR || path.join(CONFIG_DIR, 'logs');
 const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
 const CONFIG_PATH = process.env.LAZYDEV_CONFIG || path.join(CONFIG_DIR, 'projects.json');
+
+// The control-plane capability token lives next to the registry, so a test that
+// points LAZYDEV_CONFIG at a temp file also gets an isolated token file there.
+// (CONFIG_DIR is the module's own dir and is NOT overridable; deriving from the
+// config file's directory keeps the real repo's control-token untouched in tests.)
+const STATE_DIR = path.dirname(CONFIG_PATH);
+const CONTROL_TOKEN_PATH = process.env.LAZYDEV_CONTROL_TOKEN_PATH || path.join(STATE_DIR, 'control-token');
 
 const DEFAULTS = {
   port: 4000,
   idleTimeoutMs: 1_800_000, // 30 min
   startTimeoutMs: 120_000, // 2 min
   installTimeoutMs: 300_000, // 5 min
+  connectionHardCapMs: 7_200_000, // 2h — a connection silent this long stops deferring the reaper
 };
 
 // Loopback families to try, in order. `localhost` on this machine resolves
 // ::1 (IPv6) first; Next binds 0.0.0.0 (reachable via 127.0.0.1) but Vite binds
 // `localhost` -> ::1 ONLY, so we must try both families everywhere we connect.
 const LOOPBACK_HOSTS = ['127.0.0.1', '::1'];
+
+// How long a cold request waits for bring-up to SETTLE before it stops blocking
+// and hands off to the status page / 503-retry. It covers the fast decisions —
+// adopting an already-listening server, or rejecting a cwd-mismatch port
+// conflict (a local probe + a synchronous lsof) — so those answer on the first
+// hit, while a real spawn+startup (far longer) stays non-blocking. Kept well
+// under the cold-nav responsiveness budget.
+const COLD_SETTLE_GRACE_MS = 120;
 
 const STARTED_AT = Date.now();
 
@@ -48,10 +68,50 @@ function ensureDir(dir) {
     /* ignore */
   }
 }
-ensureDir(LOGS_DIR);
 
 function ts() {
   return new Date().toISOString();
+}
+
+// Cap a log file at maxBytes, keeping at most `keep` rotated generations
+// (x.log -> x.log.1 -> ... -> x.log.<keep>, pruning older). Best-effort: any
+// fs error is swallowed so logging can never crash the daemon. Called at the
+// ONE place each log is opened for append (daemon.log in log(); per-project
+// logs in logFdFor). Per-project logs are written by the spawned CHILD via the
+// inherited fd, not by the daemon continuously, so rotating at fd-open time
+// (each spawn/install) is the correct single choke point.
+function rotateIfNeeded(file, maxBytes = 1_000_000, keep = 3) {
+  try {
+    let size;
+    try {
+      size = fs.statSync(file).size;
+    } catch {
+      return; // file does not exist yet -> nothing to rotate
+    }
+    if (size < maxBytes) return;
+
+    // Prune the oldest generation, then shift each generation up by one:
+    // x.log.(keep-1) -> x.log.keep, ..., x.log.1 -> x.log.2, x.log -> x.log.1.
+    try {
+      fs.rmSync(`${file}.${keep}`, { force: true });
+    } catch {
+      /* ignore */
+    }
+    for (let i = keep - 1; i >= 1; i--) {
+      try {
+        fs.renameSync(`${file}.${i}`, `${file}.${i + 1}`);
+      } catch {
+        /* generation absent — ignore */
+      }
+    }
+    try {
+      fs.renameSync(file, `${file}.1`);
+    } catch {
+      /* ignore */
+    }
+  } catch {
+    /* never throw into the daemon */
+  }
 }
 
 function log(...parts) {
@@ -62,8 +122,12 @@ function log(...parts) {
   } catch {
     /* ignore */
   }
-  // daemon.log (best-effort)
+  // daemon.log (best-effort). Ensure LOGS_DIR here rather than at import so a
+  // bare `import` of this module writes nothing; mkdirSync recursive is
+  // idempotent+cheap, so the running daemon's cost/behavior is unchanged.
   try {
+    ensureDir(LOGS_DIR);
+    rotateIfNeeded(DAEMON_LOG);
     fs.appendFileSync(DAEMON_LOG, line + '\n');
   } catch {
     /* ignore */
@@ -84,6 +148,14 @@ let config = { ...DEFAULTS, projects: [] };
 const runtime = new Map();
 // lastAccess[host] = epoch ms of last proxied request
 const lastAccess = new Map();
+// connections[host] = Set of live connection records { lastByteAt }. A record is
+// one proxied keep-alive HTTP socket or one WS/HMR upgrade; `lastByteAt` is the
+// last time a byte crossed in either direction. `set.size` is the live count the
+// user sees; the reaper only counts records whose silence is within the hard cap.
+const connections = new Map();
+// Guard so a keep-alive HTTP socket carrying many requests is counted ONCE (add
+// a record on first request, decrement on socket close), not once per request.
+const CONN_TRACKED = Symbol('lazydevConnTracked');
 
 function projectByHost(host) {
   return config.projects.find((p) => p.host === host);
@@ -92,10 +164,54 @@ function projectByHost(host) {
 function getRuntime(host) {
   let r = runtime.get(host);
   if (!r) {
-    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null };
+    // lastError persists on the record after startPromise clears, so the cold
+    // status page can read WHY a background bring-up failed (see ensureUp). phase
+    // is derived from `state` by phaseLabel(); we keep a slot but state is truth.
+    // conflictDir holds the foreign cwd when a port-conflict is detected on adopt.
+    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null, lastError: null, phase: null, conflictDir: null };
     runtime.set(host, r);
   }
   return r;
+}
+
+// Lazily create + return the host's live-connection Set (mirrors getRuntime).
+function connSet(host) {
+  let s = connections.get(host);
+  if (!s) {
+    s = new Set();
+    connections.set(host, s);
+  }
+  return s;
+}
+
+// Add a live-connection record; returns it so the caller can bump lastByteAt and
+// later remove it on socket close.
+function addConn(host) {
+  const rec = { lastByteAt: Date.now() };
+  connSet(host).add(rec);
+  return rec;
+}
+
+// Remove a record on socket close. Set.delete is idempotent, so wiring this to
+// both 'close' and 'error' teardown paths cannot double-count.
+function removeConn(host, rec) {
+  connSet(host).delete(rec);
+}
+
+// Total live sockets for the host — what the status/CLI/dashboard display.
+function connCount(host) {
+  return connSet(host).size;
+}
+
+// Records that still DEFER the reaper: those with a byte within the hard cap. A
+// connection silent longer than connectionHardCapMs no longer counts, so an
+// abandoned-but-open tab stops protecting the project from the idle reaper.
+function activeConnCount(host, now) {
+  let n = 0;
+  for (const rec of connSet(host)) {
+    if (now - rec.lastByteAt <= config.connectionHardCapMs) n++;
+  }
+  return n;
 }
 
 function loadConfig(reason) {
@@ -118,6 +234,7 @@ function loadConfig(reason) {
     idleTimeoutMs: Number.isFinite(parsed.idleTimeoutMs) ? parsed.idleTimeoutMs : DEFAULTS.idleTimeoutMs,
     startTimeoutMs: Number.isFinite(parsed.startTimeoutMs) ? parsed.startTimeoutMs : DEFAULTS.startTimeoutMs,
     installTimeoutMs: Number.isFinite(parsed.installTimeoutMs) ? parsed.installTimeoutMs : DEFAULTS.installTimeoutMs,
+    connectionHardCapMs: Number.isFinite(parsed.connectionHardCapMs) ? parsed.connectionHardCapMs : DEFAULTS.connectionHardCapMs,
     projects: Array.isArray(parsed.projects) ? parsed.projects : [],
   };
   config = next;
@@ -248,6 +365,82 @@ async function probePort(port, timeoutMs = 300) {
   }
 }
 
+// Resolve the working directory of the process LISTENing on `port`, via lsof
+// (macOS). Returns the cwd string, or null when it cannot be determined (lsof
+// missing/ENOENT, non-zero exit, timeout, or unparseable output). NEVER throws
+// — a null return means "unknown", and ensureUp degrades to the legacy adopt
+// instead of blocking. Two -F (field) queries: first the listening PID on the
+// port, then that PID's cwd file descriptor.
+function defaultResolvePidCwd(port) {
+  let pid;
+  try {
+    const out = execFileSync('lsof', ['-nP', '-iTCP:' + port, '-sTCP:LISTEN', '-Fpn'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    // -F output is one field per line; a `p<pid>` line starts each process
+    // record. A listener may show multiple fds but the same pid repeats — take
+    // the first.
+    for (const line of out.split('\n')) {
+      if (line[0] === 'p') {
+        pid = line.slice(1).trim();
+        break;
+      }
+    }
+    if (!pid) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    // The `n<path>` line carries the cwd path for the cwd fd.
+    for (const line of out.split('\n')) {
+      if (line[0] === 'n') {
+        const p = line.slice(1).trim();
+        return p || null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Mutable binding so the bundled self-test can swap in a fake resolver (same
+// spirit as LAZYDEV_CONFIG / LAZYDEV_REAP_INTERVAL_MS) and never spawn lsof.
+// ensureUp calls through this binding, so the setter must reassign it in place.
+let resolvePidCwd = defaultResolvePidCwd;
+function __setResolvePidCwd(fn) {
+  resolvePidCwd = typeof fn === 'function' ? fn : defaultResolvePidCwd;
+}
+
+// True if two directory paths refer to the same directory. Resolves both (so
+// trailing-slash / `.` segments don't matter) and, best-effort, dereferences
+// symlinks — lsof reports the real path, but project.dir may be a symlink, so a
+// plain string compare would wrongly flag a legitimate manual server.
+function sameDir(a, b) {
+  if (!a || !b) return false;
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  if (ra === rb) return true;
+  let realA = ra;
+  let realB = rb;
+  try {
+    realA = fs.realpathSync(ra);
+  } catch {
+    /* path may not exist locally (e.g. lsof's view); fall back to resolved */
+  }
+  try {
+    realB = fs.realpathSync(rb);
+  } catch {
+    /* ignore */
+  }
+  return realA === realB;
+}
+
 // Poll until SOME loopback family accepts a connection or we time out. Resolves
 // the host string that worked (so ensureUp can pin state.upstreamHost).
 function waitForPort(port, timeoutMs) {
@@ -269,9 +462,17 @@ function waitForPort(port, timeoutMs) {
 // Lifecycle: ensureUp / stop
 // ---------------------------------------------------------------------------
 
+// Open (append) the per-project log fd handed to the spawned child via stdio.
+// This is the SOLE opener of per-project logs — called once per install spawn
+// (runInstall) and once per start spawn (ensureUp). The daemon never appends to
+// this fd itself; the child owns it continuously. So fd-open time is the only
+// choke point the daemon controls: we rotate here, capping the log at each
+// spawn/install. Deliberate limitation: a single long-running dev server whose
+// log grows past 1 MB is only rotated on its NEXT spawn, not mid-run.
 function logFdFor(host) {
   const file = path.join(LOGS_DIR, `${host}.log`);
   try {
+    rotateIfNeeded(file);
     return fs.openSync(file, 'a');
   } catch (err) {
     log(`spawn: cannot open log fd for ${host}: ${err.message}`);
@@ -406,21 +607,61 @@ async function ensureUp(project) {
   // probe and the adopt-or-spawn decision all live inside this closure; there
   // must be no `await` between the `r.startPromise` check above and this line.
   r.startPromise = (async () => {
+    // Fresh attempt — clear any failure recorded by a previous bring-up so the
+    // status page doesn't show stale wording while this one is in flight.
+    r.lastError = null;
     // Probe the port (both loopback families). If something is already
-    // listening, adopt it (do NOT spawn) and remember which family answered.
+    // listening, decide whether to adopt it (do NOT spawn) by verifying the
+    // listener's working directory. All of this runs inside the mutex closure.
     const openHost = await probePort(project.port, 300);
     if (openHost) {
-      r.upstreamHost = openHost;
-      // Is it our own owned child, or an external process?
+      // Our own live child re-probed: keep it (no ownership check needed).
       if (r.owned && r.child && r.child.exitCode === null) {
+        r.upstreamHost = openHost;
         r.state = 'running';
-      } else {
+        r.conflictDir = null;
+        return;
+      }
+      // External listener: verify ownership by cwd before adopting. A dev server
+      // you started by hand FROM the project dir is yours (matching cwd); a
+      // stray process squatting the port is not.
+      const cwd = resolvePidCwd(project.port); // null when lsof unavailable/unresolved
+      if (cwd === null) {
+        // Cannot determine cwd (lsof missing, etc.) -> degrade to the legacy
+        // adopt rather than blocking a possibly-legitimate server.
+        log(`adopt: ${host} port ${project.port} busy, cwd unresolved -> adopting (external, unverified)`);
+        r.upstreamHost = openHost;
         r.state = 'running';
         r.owned = false;
         r.child = null;
         r.pid = null;
+        r.conflictDir = null;
+        return;
       }
-      return;
+      if (sameDir(cwd, project.dir)) {
+        log(`adopt: ${host} external listener cwd matches ${project.dir} -> adopting`);
+        r.upstreamHost = openHost;
+        r.state = 'running';
+        r.owned = false;
+        r.child = null;
+        r.pid = null;
+        r.conflictDir = null;
+        return;
+      }
+      // Mismatch: someone else owns this port. Do NOT proxy — surface a visible
+      // conflict and reject so no caller ever pipes a request to the foreigner.
+      log(`conflict: ${host} port ${project.port} held by process in ${cwd} (expected ${project.dir}) -> conflict`);
+      r.state = 'conflict';
+      r.owned = false;
+      r.child = null;
+      r.pid = null;
+      r.upstreamHost = null;
+      r.conflictDir = cwd; // remember foreign cwd for status/dashboard detail
+      const e = new Error('portConflict');
+      e.code = 'PORT_CONFLICT';
+      e.host = host;
+      e.conflictDir = cwd;
+      throw e; // rejects startPromise -> handleRequest/handleUpgrade/up never proxy
     }
 
     // Need to spawn. Install (if needed) and start are ONE atomic operation, so
@@ -441,6 +682,9 @@ async function ensureUp(project) {
         const e = new Error('installFailed');
         e.code = 'START_TIMEOUT'; // route through the existing 502-with-log page
         e.host = host;
+        // Record before throwing: handleRequest no longer awaits us on the cold
+        // path, so the status page reads r.lastError after startPromise clears.
+        r.lastError = { code: e.code, message: e.message, at: Date.now() };
         throw e;
       }
     }
@@ -521,6 +765,9 @@ async function ensureUp(project) {
       const e = new Error(`startTimeout`);
       e.code = 'START_TIMEOUT';
       e.host = host;
+      // Record before throwing (see install-failed site): the cold status page
+      // reads r.lastError after startPromise clears in the finally below.
+      r.lastError = { code: e.code, message: e.message, at: Date.now() };
       throw e;
     }
   })();
@@ -559,8 +806,11 @@ function stop(host, reason = 'manual') {
   const pid = r.pid;
   log(`stop: ${host} (pid group ${pid}, ${reason}) -> SIGTERM`);
   killGroup(r, 'SIGTERM');
-  // Escalate to SIGKILL if still alive after 5s.
-  setTimeout(() => {
+  // Escalate to SIGKILL if still alive after 5s. unref() so this lone timer can
+  // never keep the process alive on its own — the daemon stays up via its
+  // listeners in production, and a test that stop()s a child shouldn't have to
+  // wait out this timer to exit.
+  const escalate = setTimeout(() => {
     try {
       // signal 0 = liveness check
       process.kill(-pid, 0);
@@ -578,6 +828,7 @@ function stop(host, reason = 'manual') {
       /* already gone */
     }
   }, 5000);
+  escalate.unref?.();
   r.state = 'stopped';
   r.owned = false;
   r.child = null;
@@ -633,6 +884,202 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// Decide whether a cold-hit request should get the HTML status page (a human in
+// a browser navigating) or a plain 503 (curl / XHR / webhook that wants data).
+// A real navigation sets Sec-Fetch-Mode: navigate; failing that, the request is
+// HTML only if Accept asks for text/html and did NOT lead with application/json
+// (curl sends */*, fetch/XHR that wants JSON leads with application/json).
+function wantsHtml(req) {
+  const sfm = String((req.headers && req.headers['sec-fetch-mode']) || '').toLowerCase();
+  if (sfm === 'navigate') return true;
+  const accept = String((req.headers && req.headers['accept']) || '');
+  const first = accept.split(',')[0].trim().toLowerCase();
+  return /text\/html/i.test(accept) && !first.startsWith('application/json');
+}
+
+// Map the runtime `state` (the source of truth) to a human phase word for the
+// status page. 'failed' is state==='stopped' WITH a recorded lastError; a plain
+// 'stopped' before the first probe reads as 'waking'.
+function phaseLabel(r) {
+  if (r.state === 'installing') return 'installing';
+  if (r.state === 'starting') return 'starting';
+  if (r.state === 'stopped' && r.lastError) return 'failed';
+  return 'waking';
+}
+
+// Self-refreshing HTML served on a cold navigation hit. Names the project + its
+// phase, tails the install/start log, and — unless the start already failed —
+// polls the SAME url with Accept: application/json and reloads once that stops
+// returning 503 (i.e. the port answered and the request proxied to the app).
+// `r` may be the live runtime record OR a {state, lastError} snapshot taken by
+// handleRequest before it re-kicked bring-up; only those two fields are read.
+//
+// Log tails and the raw failure message can leak filesystem paths, so they are
+// shown ONLY to an authorized caller (same-origin + capability token). An
+// ordinary browser navigation carries no token, so `authorized` is false and the
+// page redacts the log, pointing the user at `lazydev logs <host>` instead.
+function statusPageHtml(project, r, authorized = false) {
+  const host = project.host;
+  const phase = phaseLabel(r);
+  // Either the real log tail (authorized) or a redaction notice pointing at the
+  // CLI, which reads the log locally where the token isn't needed.
+  const logBlock = (lines) =>
+    authorized
+      ? `<p>Last lines of <code>logs/${esc(host)}.log</code>:</p><pre>${esc(tailLog(host, lines))}</pre>`
+      : `<p class="muted">Log output is hidden. Check it with <code>lazydev logs ${esc(host)}</code>.</p>`;
+  if (phase === 'failed') {
+    // The raw error message can leak paths too — redact it for the unauthorized.
+    const reason = authorized
+      ? (r.lastError && (r.lastError.message || r.lastError.code)) || 'unknown error'
+      : 'The dev server failed to start.';
+    // Terminal page: no auto-refresh. Mirror the START_TIMEOUT copy so wording
+    // stays consistent, and offer a manual retry link to the same URL.
+    return htmlPage(
+      `${host} — failed to start`,
+      `<h1>${esc(host)} failed to start</h1>
+       <p>The dev server did not open <code>127.0.0.1:${project.port}</code> within ${Math.round(config.startTimeoutMs / 1000)}s.</p>
+       <p class="muted">${esc(reason)}</p>
+       ${logBlock(40)}
+       <p><a href="${esc('/')}">Retry</a></p>${dashboardHomeLink()}`
+    );
+  }
+  // Non-terminal: waking / installing / starting. Show recent log output (may be
+  // the '(no log output captured)' sentinel this early — that's fine) and a poll
+  // loop that hands off to the app without a manual reload once the port answers.
+  return htmlPage(
+    `${host} — ${phase}`,
+    `<h1>${esc(host)} is ${esc(phase)}</h1>
+     <p class="muted">lazydev is bringing this project up. This page reloads into the app automatically once it answers.</p>
+     ${logBlock(20)}${dashboardHomeLink()}
+     <noscript><meta http-equiv="refresh" content="2"></noscript>
+     <script>
+       // Poll the same URL asking for JSON: while bringing up, handleRequest
+       // returns 503; once the port answers the request proxies to the app and
+       // the status is no longer 503 — that edge is our cue to reload.
+       setInterval(async () => {
+         try {
+           const res = await fetch(location.href, { headers: { 'accept': 'application/json' }, cache: 'no-store' });
+           if (res.status !== 503) location.reload();
+         } catch (e) { /* daemon momentarily unreachable; keep polling */ }
+       }, 1000);
+     </script>`
+  );
+}
+
+// Cold-hit answer for non-navigation clients (curl / XHR / webhook): a plain
+// 503 with Retry-After and NO HTML body, so simple clients keep retrying and
+// the status-page poll gets its 503 signal.
+function sendRetry(res, project, r) {
+  res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '1' });
+  res.end(phaseLabel(r) + '\n');
+}
+
+// Terminal answer for a port CONFLICT: the project's port is held by a foreign
+// process (a dev server started from some OTHER directory). We must never proxy
+// to it and never invite a retry, so this is a hard 502 — NOT the transient 503.
+// A browser navigation gets an HTML explanation; curl/XHR gets a plain 502. The
+// foreign cwd is a filesystem path, so it is shown only to an authorized caller
+// (same-origin + token); an ordinary navigation gets it redacted.
+function sendConflict(req, res, project, r, authorized = false) {
+  const host = project.host;
+  const dir = r && r.conflictDir;
+  if (wantsHtml(req)) {
+    const detail = authorized && dir
+      ? `<p class="muted">Port <code>${project.port}</code> is held by a process running in <code>${esc(dir)}</code>, not <code>${esc(project.dir)}</code>.</p>`
+      : `<p class="muted">Its port is held by another process that lazydev did not start. Stop that process, or point this project at a free port.</p>`;
+    return sendHtml(
+      res,
+      502,
+      `lazydev — ${host} port conflict`,
+      `<h1>${esc(host)} has a port conflict</h1>
+       <p>lazydev refused to proxy: something else is already listening on <code>127.0.0.1:${project.port}</code> and it was not started from this project's directory.</p>
+       ${detail}${dashboardHomeLink()}`
+    );
+  }
+  res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+  res.end('port conflict\n');
+}
+
+// True only for loopback: IPv4 127.0.0.0/8, IPv6 ::1, and IPv4-mapped IPv6 like
+// ::ffff:127.0.0.1. Everything else (LAN IPs, 0.0.0.0, '', undefined) is false.
+// Used to fail-closed on any request that did not arrive on a loopback bind.
+function isLoopbackAddress(addr) {
+  if (!addr || typeof addr !== 'string') return false;
+  let a = addr;
+  // Strip an IPv4-mapped IPv6 prefix so ::ffff:127.0.0.1 is judged as 127.0.0.1.
+  const mapped = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) a = mapped[1];
+  if (a === '::1') return true;
+  // IPv4 127.0.0.0/8
+  const m = a.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) return Number(m[1]) === 127;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Control-plane authorization: capability token + same-origin check
+// ---------------------------------------------------------------------------
+
+// The token authorizes every mutating control action (reload / stop / up) and
+// the log-tail exposure on error pages. It is minted lazily — never at import
+// time — so a bare `import` in a unit test writes nothing to disk unless that
+// test opts in by calling ensureControlToken().
+let CONTROL_TOKEN = null;
+function ensureControlToken() {
+  if (CONTROL_TOKEN) return CONTROL_TOKEN;
+  // Reuse a token already on disk (survives daemon restarts so open CLI/tabs
+  // keep working); otherwise mint one.
+  try {
+    const existing = fs.readFileSync(CONTROL_TOKEN_PATH, 'utf8').trim();
+    if (existing) {
+      CONTROL_TOKEN = existing;
+      return CONTROL_TOKEN;
+    }
+  } catch {
+    /* not present yet */
+  }
+  const tok = crypto.randomBytes(32).toString('hex');
+  try {
+    ensureDir(path.dirname(CONTROL_TOKEN_PATH));
+    fs.writeFileSync(CONTROL_TOKEN_PATH, tok + '\n', { mode: 0o600 });
+    try {
+      fs.chmodSync(CONTROL_TOKEN_PATH, 0o600);
+    } catch {
+      /* ignore */
+    }
+  } catch (err) {
+    log(`control-token: could not persist to ${CONTROL_TOKEN_PATH} (${err.message}); using in-memory token`);
+  }
+  CONTROL_TOKEN = tok;
+  return CONTROL_TOKEN;
+}
+
+// A control request is same-origin when it has NO Origin header (non-browser
+// caller, e.g. the CLI) OR its Origin host matches the daemon's own Host header.
+// A foreign Origin (some other site's page POSTing here) is refused. CSRF only
+// applies to browser-driven cross-site requests; the CLI is not a browser, so
+// the token alone is its proof.
+function isSameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // curl / CLI — no browser Origin to forge
+  let originHost;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  const selfHost = String(req.headers.host || '').toLowerCase();
+  return originHost.toLowerCase() === selfHost;
+}
+
+// Authorized == same-origin AND correct token. Both are required for every
+// mutating control action and for exposing log tails on error pages.
+function isControlAuthorized(req) {
+  if (!isSameOrigin(req)) return false;
+  const tok = req.headers['x-lazydev-token'];
+  return typeof tok === 'string' && tok.length > 0 && tok === ensureControlToken();
+}
+
 // ---------------------------------------------------------------------------
 // Control plane
 // ---------------------------------------------------------------------------
@@ -650,8 +1097,12 @@ function liveState(host, project) {
     framework: project.framework || 'node',
     state,
     owned,
+    conflict: state === 'conflict',
+    conflictDir: r ? r.conflictDir || null : null,
     lastAccess: la || null,
     idleForMs: la ? Date.now() - la : null,
+    connCount: connCount(host),
+    activeConnCount: activeConnCount(host, Date.now()),
   };
 }
 
@@ -674,6 +1125,14 @@ async function handleControl(req, res, url) {
 
   if (method === 'GET' && pathname === '/__lazydev/status') {
     return sendJson(res, 200, statusPayload());
+  }
+
+  // One guard for every mutating control action: reject any POST /__lazydev/*
+  // that is not both same-origin AND carrying the capability token. GET / and
+  // GET /__lazydev/status stay ungated so the CLI's read path and the dashboard
+  // load keep working; neither exposes anything sensitive.
+  if (method === 'POST' && pathname.startsWith('/__lazydev/') && !isControlAuthorized(req)) {
+    return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
   }
 
   if (method === 'POST' && pathname === '/__lazydev/reload') {
@@ -720,6 +1179,9 @@ function stateBadge(state, owned) {
   if (state === 'installing') {
     return '<span style="background:#7c3aed;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">installing</span>';
   }
+  if (state === 'conflict') {
+    return '<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">conflict</span>';
+  }
   return '<span style="background:#64748b;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">sleeping</span>';
 }
 
@@ -734,6 +1196,11 @@ function fmtIdle(ms) {
 }
 
 function dashboardHtml() {
+  // The dashboard is served same-origin, so injecting the control token into its
+  // inline script is safe: the browser's same-origin policy stops other sites
+  // reading this HTML. The Sleep button's fetch sends it back as a header, which
+  // authorizes the stop POST. JSON.stringify quotes/escapes it for JS string use.
+  const token = ensureControlToken();
   const rows = config.projects
     .map((p) => {
       const ls = liveState(p.host, p);
@@ -741,11 +1208,16 @@ function dashboardHtml() {
       const sleepBtn = ls.owned && ls.state !== 'stopped'
         ? `<button onclick="sleepHost('${esc(p.host)}')">Sleep</button>`
         : `<button disabled>Sleep</button>`;
+      // On conflict, hovering the state cell explains which foreign cwd holds it.
+      const stateTitle = ls.state === 'conflict' && ls.conflictDir
+        ? ` title="port held by ${esc(ls.conflictDir)}"`
+        : '';
       return `<tr>
         <td><a href="http://${esc(p.host)}.localhost/">http://${esc(p.host)}.localhost</a>${enabledNote}</td>
         <td>${esc(ls.framework)}</td>
-        <td>${stateBadge(ls.state, ls.owned)}</td>
+        <td${stateTitle}>${stateBadge(ls.state, ls.owned)}</td>
         <td>${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
+        <td>${ls.connCount}</td>
         <td>${sleepBtn}</td>
       </tr>`;
     })
@@ -763,13 +1235,16 @@ function dashboardHtml() {
     button:not(:disabled):hover { background: #8882; }
   </style>
   <table>
-    <thead><tr><th>Project</th><th>Framework</th><th>State</th><th>Idle</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="5" class="muted">No projects registered.</td></tr>'}</tbody>
+    <thead><tr><th>Project</th><th>Framework</th><th>State</th><th>Idle</th><th>Conn</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="muted">No projects registered.</td></tr>'}</tbody>
   </table>
   <script>
     async function sleepHost(h) {
       try {
-        await fetch('/__lazydev/stop/' + encodeURIComponent(h), { method: 'POST' });
+        await fetch('/__lazydev/stop/' + encodeURIComponent(h), {
+          method: 'POST',
+          headers: { 'X-Lazydev-Token': ${JSON.stringify(token)} },
+        });
       } catch (e) {}
       location.reload();
     }
@@ -801,6 +1276,26 @@ const upstreamAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 1000, ma
 function proxyHttp(req, res, project) {
   const host = project.host;
   const r = runtime.get(host);
+
+  // Count the client SOCKET once, not per request: a browser holds a keep-alive
+  // socket open across navigations (often with zero in-flight requests) — those
+  // are exactly the "live tab" sockets the reaper must defer to. Guard with a
+  // symbol so a reused socket doesn't add a second record (only one 'close'
+  // fires, so per-request counting would inflate the count and leak records).
+  const cs = req.socket;
+  if (cs && !cs[CONN_TRACKED]) {
+    cs[CONN_TRACKED] = true;
+    const rec = addConn(host);
+    cs.__lazydevRec = rec;
+    cs.once('close', () => removeConn(host, rec));
+    // A single 'data' listener keeps lastByteAt fresh on real traffic; a truly
+    // silent keep-alive socket ages past the hard cap and stops deferring.
+    cs.on('data', () => {
+      rec.lastByteAt = Date.now();
+    });
+  }
+  if (cs && cs.__lazydevRec) cs.__lazydevRec.lastByteAt = Date.now();
+
   // ensureUp() already probed both loopback families and pinned the one that
   // answered (Vite -> ::1, Next -> 127.0.0.1), so we proxy straight to it — no
   // per-request family race, which lets us pipe the body immediately.
@@ -866,24 +1361,56 @@ function proxyHttp(req, res, project) {
 // Request handler
 // ---------------------------------------------------------------------------
 
-const server = http.createServer((req, res) => {
-  try {
-    handleRequest(req, res);
-  } catch (err) {
-    log(`request-handler crash: ${err && err.stack ? err.stack : err}`);
+// Every loopback listener we bind under RUN_AS_MAIN, so shutdown() can close
+// them all (127.0.0.1 primary + ::1 best-effort).
+const daemonServers = [];
+
+// Build a daemon HTTP server: the request try/catch wrapper plus the upgrade
+// (WebSocket/HMR) handler, both fail-closed against non-loopback binds. Called
+// once per loopback listener under RUN_AS_MAIN, and directly by the self-test.
+function createDaemonServer() {
+  const srv = http.createServer((req, res) => {
     try {
-      if (!res.headersSent) {
-        sendHtml(res, 500, 'lazydev — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
-      } else {
-        res.destroy();
+      handleRequest(req, res);
+    } catch (err) {
+      log(`request-handler crash: ${err && err.stack ? err.stack : err}`);
+      try {
+        if (!res.headersSent) {
+          sendHtml(res, 500, 'lazydev — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
+        } else {
+          res.destroy();
+        }
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
     }
-  }
-});
+  });
+
+  srv.on('upgrade', (req, clientSocket, head) => {
+    handleUpgrade(req, clientSocket, head).catch((err) => {
+      log(`upgrade-handler crash: ${err && err.message}`);
+      try {
+        clientSocket.destroy();
+      } catch {
+        /* ignore */
+      }
+    });
+  });
+
+  return srv;
+}
 
 async function handleRequest(req, res) {
+  // Fail-closed: only serve requests that arrived on a loopback address. Even if
+  // a listener ends up bound to a routable interface, a request from off-box is
+  // rejected here rather than reaching the control plane or a dev server.
+  if (!isLoopbackAddress(req.socket && req.socket.localAddress)) {
+    log(`forbidden: non-loopback request on ${req.socket && req.socket.localAddress}`);
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('forbidden\n');
+    return;
+  }
+
   const hostHeader = req.headers.host || '';
   const key = resolveHostKey(hostHeader);
   // Parse URL relative to a dummy base; we only need pathname.
@@ -925,50 +1452,100 @@ async function handleRequest(req, res) {
     );
   }
 
-  // Ensure the dev server is up, then proxy.
-  try {
-    await ensureUp(project);
-  } catch (err) {
-    if (err && err.code === 'START_TIMEOUT') {
-      return sendHtml(
-        res,
-        502,
-        'lazydev — start timed out',
-        `<h1>${esc(project.host)} failed to start</h1>
-         <p>The dev server did not open <code>127.0.0.1:${project.port}</code> within ${Math.round(config.startTimeoutMs / 1000)}s.</p>
-         <p>Last lines of <code>logs/${esc(project.host)}.log</code>:</p>
-         <pre>${esc(tailLog(project.host, 40))}</pre>${dashboardHomeLink()}`
-      );
-    }
-    return sendHtml(
-      res,
-      502,
-      'lazydev — start error',
-      `<h1>${esc(project.host)} could not start</h1><pre>${esc(String(err && err.message))}</pre>
-       <p>Log tail:</p><pre>${esc(tailLog(project.host, 40))}</pre>${dashboardHomeLink()}`
-    );
+  const r = getRuntime(project.host);
+
+  // Warm path: the project is running AND a probe/adopt already pinned the
+  // family that answered. upstreamHost is the honest "port answered" signal, so
+  // this is the only case where we proxy straight through (WS/HMR keep working).
+  if (r.state === 'running' && r.upstreamHost) {
+    lastAccess.set(project.host, Date.now());
+    return proxyHttp(req, res, project);
   }
 
-  lastAccess.set(project.host, Date.now());
-  proxyHttp(req, res, project);
+  // A prior bring-up found the port held by a foreign process (cwd mismatch).
+  // A conflict is TERMINAL, not transient — never proxy to the foreigner and
+  // never tell the client to retry. Surface it as a 502 straight away.
+  if (r.state === 'conflict') {
+    return sendConflict(req, res, project, r, isControlAuthorized(req));
+  }
+
+  // Cold path.
+  //
+  // Snapshot the phase + failure reason BEFORE kicking a fresh attempt below,
+  // because kicking ensureUp synchronously clears r.lastError (fresh-attempt
+  // reset) — so a page rendered off the live record after the kick would never
+  // show the failure that just occurred. The snapshot is what a slow-path client
+  // sees; the kick starts a new bring-up behind it so a reload lands on the app.
+  const snapshot = { state: r.state, lastError: r.lastError };
+
+  // Kick bring-up in the background exactly once. ensureUp claims r.startPromise
+  // synchronously before any await (the #9cb548a fix), so kicking it here yields
+  // exactly ONE child for N concurrent hits. The .catch is MANDATORY: a
+  // start-timeout / conflict rejection would otherwise surface as an
+  // unhandledRejection. lastError is recorded inside ensureUp before it throws,
+  // so swallowing the rejection here loses nothing.
+  if (!r.startPromise) {
+    ensureUp(project).catch(() => {});
+  }
+  // Wait only a GRACE window for the attempt to settle — long enough for the
+  // fast decisions (adopt an already-listening server, or reject as a port
+  // conflict: a local probe + a synchronous lsof) but NOT for a real
+  // spawn+startup, which must stay non-blocking (a cold nav answers <200ms,
+  // never ~startTimeout). The timer firing leaves the attempt mid-flight.
+  if (r.startPromise) {
+    await Promise.race([
+      r.startPromise.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, COLD_SETTLE_GRACE_MS)),
+    ]);
+  }
+
+  // Adopt settled within the grace -> the port answered; proxy straight through.
+  if (r.state === 'running' && r.upstreamHost) {
+    lastAccess.set(project.host, Date.now());
+    return proxyHttp(req, res, project);
+  }
+  // Conflict settled within the grace -> terminal 502, never proxy.
+  if (r.state === 'conflict') {
+    return sendConflict(req, res, project, r, isControlAuthorized(req));
+  }
+
+  // Still bringing up (or the fresh attempt already failed): answer immediately
+  // and let the client (or the status page's poll) drive the retry, rendering
+  // from the PRE-KICK snapshot so a reload after a failure shows that failure.
+
+  // Navigation (browser) -> self-refreshing status page (200 so the browser
+  // renders it and runs the poll script instead of showing its own error UI).
+  // A failed start renders the failure reason + log tail in that same page, but
+  // only for an authorized caller — an ordinary navigation carries no token, so
+  // the log/error is redacted (see statusPageHtml).
+  if (wantsHtml(req)) {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(statusPageHtml(project, snapshot, isControlAuthorized(req)));
+    return;
+  }
+
+  // Everything else (curl / XHR / webhook, including the status page's own poll)
+  // -> plain 503 with Retry-After, no HTML. Also covers the failed state: keep
+  // it 503 so simple clients keep retrying; the failure detail is for humans.
+  return sendRetry(res, project, snapshot);
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket / HMR upgrade proxy
 // ---------------------------------------------------------------------------
 
-server.on('upgrade', (req, clientSocket, head) => {
-  handleUpgrade(req, clientSocket, head).catch((err) => {
-    log(`upgrade-handler crash: ${err && err.message}`);
+async function handleUpgrade(req, clientSocket, head) {
+  // Fail-closed: same loopback gate as handleRequest, for WS/HMR upgrades.
+  if (!isLoopbackAddress(clientSocket && clientSocket.localAddress)) {
+    log(`forbidden upgrade: non-loopback on ${clientSocket && clientSocket.localAddress}`);
     try {
       clientSocket.destroy();
     } catch {
       /* ignore */
     }
-  });
-});
+    return;
+  }
 
-async function handleUpgrade(req, clientSocket, head) {
   const hostHeader = req.headers.host || '';
   const key = resolveHostKey(hostHeader);
 
@@ -1036,7 +1613,14 @@ async function handleUpgrade(req, clientSocket, head) {
     return;
   }
 
+  // Count this WS/HMR socket as one live connection. The record is created here,
+  // after the upstream connected, so a failed-connect path above never leaks one.
+  // teardown runs on 'error'/'close'/'end' of either socket; Set.delete is
+  // idempotent, so removeConn is safe to call more than once.
+  const rec = addConn(project.host);
+
   const teardown = () => {
+    removeConn(project.host, rec);
     try {
       clientSocket.destroy();
     } catch {
@@ -1054,8 +1638,14 @@ async function handleUpgrade(req, clientSocket, head) {
     teardown();
   });
   upstream.on('close', teardown);
+  upstream.on('end', teardown);
   clientSocket.on('error', teardown);
   clientSocket.on('close', teardown);
+  // A closed browser tab FIN-half-closes its HMR socket. Because the upstream
+  // pipe keeps the socket's writable side open, 'close' never fires — so without
+  // also tearing down on 'end', the record (and the socket pair) would leak and
+  // the connection would keep deferring the reaper forever. Reap on either FIN.
+  clientSocket.on('end', teardown);
 
   // Socket is already connected — replay the original request line + headers.
   const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
@@ -1070,7 +1660,14 @@ async function handleUpgrade(req, clientSocket, head) {
   clientSocket.pipe(upstream);
   upstream.pipe(clientSocket);
 
-  const bump = () => lastAccess.set(project.host, Date.now());
+  // Bump keeps both the idle clock (lastAccess) and this connection's byte clock
+  // (rec.lastByteAt) fresh, so an actively-used HMR socket keeps deferring the
+  // reaper while a silent one ages past the hard cap.
+  const bump = () => {
+    const t = Date.now();
+    lastAccess.set(project.host, t);
+    rec.lastByteAt = t;
+  };
   clientSocket.on('data', bump);
   upstream.on('data', bump);
 }
@@ -1085,8 +1682,14 @@ function reapIdle() {
     const host = project.host;
     const r = runtime.get(host);
     if (!r) continue;
-    // Only reap things WE started.
+    // Only reap things WE started (adoption sets owned=false), so an external /
+    // adopted dev server is never touched no matter how idle it looks.
     if (r.state !== 'running' || !r.owned) continue;
+    // A live tab or active HMR socket (bytes within the hard cap) defers the
+    // reap. A socket silent past connectionHardCapMs drops out of `active`, so an
+    // abandoned tab stops protecting the project — it does NOT gate byte activity.
+    const active = activeConnCount(host, now);
+    if (active > 0) continue;
     const la = lastAccess.get(host) || 0;
     if (la === 0) continue; // never accessed; leave it
     const idle = now - la;
@@ -1133,10 +1736,12 @@ function shutdown(sig) {
   }
   // Give children a moment to exit, then go.
   setTimeout(() => {
-    try {
-      server.close();
-    } catch {
-      /* ignore */
+    for (const srv of daemonServers) {
+      try {
+        srv.close();
+      } catch {
+        /* ignore */
+      }
     }
     process.exit(0);
   }, 500);
@@ -1155,6 +1760,9 @@ const RUN_AS_MAIN = process.argv[1] && path.resolve(process.argv[1]) === fileURL
 
 if (RUN_AS_MAIN) {
   loadConfig('boot');
+  // Mint (or reuse) the control token before the first request, so the file
+  // exists for the CLI to read and the dashboard HTML can embed it.
+  ensureControlToken();
   startConfigWatch();
   // Reaper cadence is 30s in production. LAZYDEV_REAP_INTERVAL_MS exists solely so
   // the bundled self-test can exercise the idle reaper quickly (same spirit as the
@@ -1162,19 +1770,102 @@ if (RUN_AS_MAIN) {
   const REAP_INTERVAL_MS = Number(process.env.LAZYDEV_REAP_INTERVAL_MS) || 30_000;
   setInterval(reapIdle, REAP_INTERVAL_MS).unref?.();
 
-  server.on('error', (err) => {
-    log(`server error: ${err && err.message}`);
+  // Bind loopback only, in two families. 127.0.0.1 is the primary front door
+  // (Caddy proxies here) — a port collision there is fatal. ::1 is best-effort:
+  // some machines have no IPv6 loopback, so a bind failure there must never take
+  // the daemon down. Nothing off this box can reach either address.
+  const primary = createDaemonServer();
+  daemonServers.push(primary);
+  primary.on('error', (err) => {
+    log(`server error (127.0.0.1): ${err && err.message}`);
     if (err && err.code === 'EADDRINUSE') {
-      log(`FATAL: port ${config.port} already in use; exiting`);
+      log(`FATAL: 127.0.0.1:${config.port} already in use; exiting`);
       process.exit(1);
     }
   });
+  primary.listen(config.port, '127.0.0.1', () => {
+    log(`lazydev listening on 127.0.0.1:${config.port} (config=${CONFIG_PATH})`);
+    log(`dashboard: http://lazydev.localhost/  (or http://127.0.0.1:${config.port}/ with Host: lazydev.localhost)`);
+  });
 
-  server.listen(config.port, () => {
-    log(`lazydev listening on :${config.port} (config=${CONFIG_PATH})`);
-    log(`dashboard: http://lazydev.localhost/  (or http://localhost:${config.port}/ with Host: lazydev.localhost)`);
+  const secondary = createDaemonServer();
+  daemonServers.push(secondary);
+  secondary.on('error', (err) => {
+    // Best-effort: never fatal. Keep serving on 127.0.0.1 regardless.
+    log(`note: IPv6 loopback [::1]:${config.port} unavailable (${err && err.code || err && err.message}); serving on 127.0.0.1 only`);
+  });
+  secondary.listen(config.port, '::1', () => {
+    log(`lazydev also listening on [::1]:${config.port}`);
   });
 }
 
+// ---------------------------------------------------------------------------
+// Self-test accessors
+// ---------------------------------------------------------------------------
+// The bundled node --test suite drives the reaper deterministically without
+// RUN_AS_MAIN (which would listen and set the 30s interval). These expose just
+// enough state to force ownership, inject connection presence, and age the idle
+// clock — the raw Maps stay encapsulated. Prefixed `__` to signal test-only,
+// matching the LAZYDEV_CONFIG / LAZYDEV_REAP_INTERVAL_MS self-test hooks.
+
+// Force runtime fields on a host (e.g. {state:'running', owned:true,
+// upstreamHost:'127.0.0.1'}). Needed because adoption forces owned=false, so a
+// test that must exercise the REAP path cannot get owned=true via a real GET.
+function __setRuntimeForTest(host, patch) {
+  Object.assign(getRuntime(host), patch);
+  return runtime.get(host);
+}
+
+// Inject a live-connection record and return it, so a test can age its
+// lastByteAt into the past to synthesize a "silent past the hard cap" socket.
+function __addConnForTest(host) {
+  return addConn(host);
+}
+
+// Drive the idle clock directly for the pure-reaper unit test.
+function __setLastAccessForTest(host, ms) {
+  lastAccess.set(host, ms);
+}
+
+// Snapshot the connection counters for assertions: total live vs. deferring.
+function __liveConnInfo(host) {
+  return { count: connCount(host), active: activeConnCount(host, Date.now()) };
+}
+
 // Exported for the bundled self-test (no behavior change for the daemon itself).
-export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS };
+// upstreamAgent is exposed so a test can destroy its pooled keep-alive sockets
+// on teardown (they'd otherwise keep the test process from exiting). log,
+// logFdFor, and LOGS_DIR are exposed (with the LAZYDEV_LOGS_DIR override) so a
+// test can prove the daemon rotates through its real logging call sites.
+export {
+  resolveHostKey,
+  loadConfig,
+  inferInstallCmd,
+  connectLoopback,
+  probePort,
+  LOOPBACK_HOSTS,
+  createDaemonServer,
+  isLoopbackAddress,
+  wantsHtml,
+  phaseLabel,
+  statusPageHtml,
+  getRuntime,
+  ensureUp,
+  stop,
+  upstreamAgent,
+  reapIdle,
+  __setRuntimeForTest,
+  __addConnForTest,
+  __setLastAccessForTest,
+  __liveConnInfo,
+  ensureControlToken,
+  isSameOrigin,
+  isControlAuthorized,
+  CONTROL_TOKEN_PATH,
+  sameDir,
+  __setResolvePidCwd,
+  rotateIfNeeded,
+  log,
+  logFdFor,
+  LOGS_DIR,
+};

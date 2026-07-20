@@ -36,7 +36,18 @@ if [ -f "$PROJECTS_JSON" ]; then
   _port="$("$NODE" -e 'try{const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).port;if(Number.isFinite(p))process.stdout.write(String(p))}catch{}' "$PROJECTS_JSON" 2>/dev/null)"
   [ -n "$_port" ] && DAEMON_PORT="$_port"
 fi
-BASE_URL="http://localhost:${DAEMON_PORT}"
+# Daemon binds loopback (127.0.0.1). Hit it by IP, not `localhost`, so we don't
+# eat an IPv6-first (::1) resolution stall on machines where that resolves first.
+BASE_URL="http://127.0.0.1:${DAEMON_PORT}"
+
+# Capability token for the control plane. The daemon writes it (mode 0600) next
+# to projects.json at boot; we read it and send it on mutating control requests.
+# tr strips the trailing newline the daemon writes.
+CONTROL_TOKEN_FILE="${CONFIG_DIR}/control-token"
+LAZYDEV_TOKEN=""
+if [ -f "$CONTROL_TOKEN_FILE" ]; then
+  LAZYDEV_TOKEN="$(tr -d '\r\n' < "$CONTROL_TOKEN_FILE" 2>/dev/null || true)"
+fi
 
 # ---------------------------------------------------------------------------
 # Colors (TTY only — no escape codes when piped/redirected)
@@ -67,9 +78,14 @@ err()  { printf '%s\n' "$*" >&2; }
 die()  { err "${C_RED}lazydev:${C_RESET} $*"; exit 1; }
 
 # curl against the control API. Args: METHOD PATH. Echoes body; returns curl's exit.
+# Sends the capability token so mutating POSTs (up/stop/reload) are authorized.
+# The CLI sends no Origin header (curl doesn't), so the daemon's same-origin
+# check passes and the token alone authorizes the request.
 api() {
   local method="$1" path="$2"
-  curl -fsS -m 10 -X "$method" -H "Host: ${DAEMON_HOST}" "${BASE_URL}${path}"
+  local hdr=()
+  [ -n "$LAZYDEV_TOKEN" ] && hdr=(-H "X-Lazydev-Token: ${LAZYDEV_TOKEN}")
+  curl -fsS -m 10 -X "$method" -H "Host: ${DAEMON_HOST}" "${hdr[@]}" "${BASE_URL}${path}"
 }
 
 # True if the daemon answers on :4000.
@@ -111,7 +127,7 @@ cmd_ls() {
 
   STATUS_JSON="$json" \
   C_RESET="$C_RESET" C_DIM="$C_DIM" C_BOLD="$C_BOLD" \
-  C_GREEN="$C_GREEN" C_YELLOW="$C_YELLOW" C_CYAN="$C_CYAN" \
+  C_GREEN="$C_GREEN" C_YELLOW="$C_YELLOW" C_CYAN="$C_CYAN" C_RED="$C_RED" \
   "$NODE" -e '
   (function () {
     const raw = process.env.STATUS_JSON || "{}";
@@ -122,6 +138,7 @@ cmd_ls() {
       green: process.env.C_GREEN || "",
       yellow:process.env.C_YELLOW || "",
       cyan:  process.env.C_CYAN || "",
+      red:   process.env.C_RED || "",
     };
     let s;
     try { s = JSON.parse(raw); } catch (e) {
@@ -167,12 +184,13 @@ cmd_ls() {
       // Stopped is presented to the user as "sleeping".
       const stateLabel = state === "stopped" ? "sleeping" : state;
       const idle  = state === "running" ? humanize(p.idleForMs) : "—";
+      const conn  = (p.connCount ?? 0).toString();
       const port  = (p.port ?? "").toString();
       const enabled = p.enabled !== false;
-      return { host, url, state, stateLabel, idle, port, enabled };
+      return { host, url, state, stateLabel, idle, conn, port, enabled };
     });
 
-    const headers = { host: "HOST", url: "URL", state: "STATE", idle: "IDLE", port: "PORT" };
+    const headers = { host: "HOST", url: "URL", state: "STATE", idle: "IDLE", conn: "CONN", port: "PORT" };
 
     // Column widths = max of header and all cell values (uncolored lengths).
     function w(key, label) {
@@ -182,6 +200,7 @@ cmd_ls() {
     const wUrl   = w("url",   headers.url);
     const wState = w("state", headers.state);
     const wIdle  = w("idle",  headers.idle);
+    const wConn  = w("conn",  headers.conn);
 
     function pad(str, width) {
       str = String(str);
@@ -194,6 +213,7 @@ cmd_ls() {
       if (!r.enabled) return C.dim + padded + C.reset;
       if (r.state === "running")  return C.green + padded + C.reset;
       if (r.state === "starting") return C.yellow + padded + C.reset;
+      if (r.state === "conflict") return C.red + padded + C.reset;
       // stopped / sleeping
       return C.dim + padded + C.reset;
     }
@@ -205,6 +225,7 @@ cmd_ls() {
       pad(headers.url, wUrl) + "  " +
       pad(headers.state, wState) + "  " +
       pad(headers.idle, wIdle) + "  " +
+      pad(headers.conn, wConn) + "  " +
       headers.port +
       C.reset
     );
@@ -217,6 +238,7 @@ cmd_ls() {
         urlCell + "  " +
         colorState(r) + "  " +
         pad(r.idle, wIdle) + "  " +
+        pad(r.conn, wConn) + "  " +
         r.port
       );
     }
