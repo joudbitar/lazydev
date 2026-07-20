@@ -7,6 +7,7 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import os from 'node:os';
+import { mergeRegistry } from './lib/registry.mjs';
 
 const HOME = os.homedir();
 // Self-locate: write the registry next to this script (project root), not a
@@ -44,12 +45,6 @@ const SERVER_HINT = /\b(next|vite|astro|remix|svelte|webpack|serve|start|dev-ser
 let existing = null;
 if (existsSync(OUT)) {
   try { existing = JSON.parse(readFileSync(OUT, 'utf8')); } catch { existing = null; }
-}
-const existingByHost = new Map();
-if (existing && Array.isArray(existing.projects)) {
-  for (const p of existing.projects) {
-    if (p && typeof p.host === 'string') existingByHost.set(p.host, p);
-  }
 }
 // Optional registry config: path substrings the scanner must skip.
 const scanExclude = existing && Array.isArray(existing.scanExclude) ? existing.scanExclude : [];
@@ -135,27 +130,7 @@ for (const dir of found) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Assign unique hosts (sanitized basename, collision -> -2, -3, ...).
-//    Never emit RESERVED_HOST.
-// ---------------------------------------------------------------------------
-const used = new Set([RESERVED_HOST]);
-// Sort by dir for deterministic collision suffixing.
-candidates.sort((a, b) => a.dir.localeCompare(b.dir));
-for (const c of candidates) {
-  let base = sanitizeHost(c.name) || 'project';
-  if (base === RESERVED_HOST) base = `${base}-2`;
-  let host = base;
-  let n = 1;
-  while (used.has(host)) {
-    n += 1;
-    host = `${base}-${n}`;
-  }
-  used.add(host);
-  c.host = host;
-}
-
-// ---------------------------------------------------------------------------
-// 6. Generate startCmd.
+// 5. Generate startCmd.
 //    Vite-based: "<pmrun> -- --port <port> --strictPort".
 //    PORT-env (next/cra/node): just "<pmrun>" (daemon injects PORT).
 // ---------------------------------------------------------------------------
@@ -168,63 +143,22 @@ function startCmdFor(framework, pm, port) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Merge with the existing registry (loaded in step 0): preserve
-//    port/enabled/startCmd for known hosts; fresh ports only for new hosts.
+// 6. Merge with the existing registry (loaded in step 0): assign unique hosts
+//    (never RESERVED_HOST), preserve port/enabled/startCmd for known hosts,
+//    fresh ports only for new hosts, and carry over hand-added entries whose
+//    directory still exists. The merge itself is pure (lib/registry.mjs); we
+//    inject the framework-aware helpers and the fs existence check.
 // ---------------------------------------------------------------------------
-
-// Ports already taken by anything the registry knows about.
-const takenPorts = new Set();
-for (const p of existingByHost.values()) {
-  if (Number.isFinite(p.port)) takenPorts.add(p.port);
-}
-
-function nextFreePort() {
-  let p = POOL_START;
-  while (takenPorts.has(p)) p += POOL_STEP;
-  takenPorts.add(p);
-  return p;
-}
-
-// Deterministic port assignment for new hosts: sort by host.
-const sortedByHost = [...candidates].sort((a, b) => a.host.localeCompare(b.host));
-const portByHost = new Map();
-for (const c of sortedByHost) {
-  const prev = existingByHost.get(c.host);
-  if (prev && Number.isFinite(prev.port)) {
-    portByHost.set(c.host, prev.port); // preserve existing
-  } else {
-    portByHost.set(c.host, nextFreePort());
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 8. Build final project objects (back in dir-sorted order).
-// ---------------------------------------------------------------------------
-const projects = candidates.map((c) => {
-  const port = portByHost.get(c.host);
-  const prev = existingByHost.get(c.host);
-  const startCmd = prev && typeof prev.startCmd === 'string'
-    ? prev.startCmd
-    : startCmdFor(c.framework, c.pm, port);
-  const enabled = prev && typeof prev.enabled === 'boolean' ? prev.enabled : true;
-  return {
-    host: c.host,
-    dir: c.dir,
-    port,
-    startCmd,
-    framework: c.framework,
-    enabled,
-  };
+const projects = mergeRegistry({
+  existing,
+  candidates,
+  reservedHost: RESERVED_HOST,
+  poolStart: POOL_START,
+  poolStep: POOL_STEP,
+  startCmdFor,
+  sanitizeHost,
+  dirExists: existsSync,
 });
-
-// Carry over registry entries the walk didn't rediscover (hand-added static
-// servers, projects outside HOME) as long as their directory still exists.
-const discovered = new Set(projects.map((p) => p.host));
-for (const [host, prev] of existingByHost) {
-  if (discovered.has(host)) continue;
-  if (!prev.dir || !existsSync(prev.dir)) continue;
-  projects.push(prev);
-}
 
 const out = {
   port: existing && Number.isFinite(existing.port) ? existing.port : 4000,
@@ -238,7 +172,7 @@ mkdirSync(CONFIG_DIR, { recursive: true });
 writeFileSync(OUT, JSON.stringify(out, null, 2) + '\n');
 
 // ---------------------------------------------------------------------------
-// 9. Report.
+// 7. Report.
 // ---------------------------------------------------------------------------
 const tilde = (p) => p.replace(HOME, '~');
 const rows = [...projects].sort((a, b) => a.port - b.port);
