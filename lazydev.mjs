@@ -92,7 +92,10 @@ function projectByHost(host) {
 function getRuntime(host) {
   let r = runtime.get(host);
   if (!r) {
-    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null };
+    // lastError persists on the record after startPromise clears, so the cold
+    // status page can read WHY a background bring-up failed (see ensureUp). phase
+    // is derived from `state` by phaseLabel(); we keep a slot but state is truth.
+    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null, lastError: null, phase: null };
     runtime.set(host, r);
   }
   return r;
@@ -406,6 +409,9 @@ async function ensureUp(project) {
   // probe and the adopt-or-spawn decision all live inside this closure; there
   // must be no `await` between the `r.startPromise` check above and this line.
   r.startPromise = (async () => {
+    // Fresh attempt — clear any failure recorded by a previous bring-up so the
+    // status page doesn't show stale wording while this one is in flight.
+    r.lastError = null;
     // Probe the port (both loopback families). If something is already
     // listening, adopt it (do NOT spawn) and remember which family answered.
     const openHost = await probePort(project.port, 300);
@@ -441,6 +447,9 @@ async function ensureUp(project) {
         const e = new Error('installFailed');
         e.code = 'START_TIMEOUT'; // route through the existing 502-with-log page
         e.host = host;
+        // Record before throwing: handleRequest no longer awaits us on the cold
+        // path, so the status page reads r.lastError after startPromise clears.
+        r.lastError = { code: e.code, message: e.message, at: Date.now() };
         throw e;
       }
     }
@@ -521,6 +530,9 @@ async function ensureUp(project) {
       const e = new Error(`startTimeout`);
       e.code = 'START_TIMEOUT';
       e.host = host;
+      // Record before throwing (see install-failed site): the cold status page
+      // reads r.lastError after startPromise clears in the finally below.
+      r.lastError = { code: e.code, message: e.message, at: Date.now() };
       throw e;
     }
   })();
@@ -559,8 +571,11 @@ function stop(host, reason = 'manual') {
   const pid = r.pid;
   log(`stop: ${host} (pid group ${pid}, ${reason}) -> SIGTERM`);
   killGroup(r, 'SIGTERM');
-  // Escalate to SIGKILL if still alive after 5s.
-  setTimeout(() => {
+  // Escalate to SIGKILL if still alive after 5s. unref() so this lone timer can
+  // never keep the process alive on its own — the daemon stays up via its
+  // listeners in production, and a test that stop()s a child shouldn't have to
+  // wait out this timer to exit.
+  const escalate = setTimeout(() => {
     try {
       // signal 0 = liveness check
       process.kill(-pid, 0);
@@ -578,6 +593,7 @@ function stop(host, reason = 'manual') {
       /* already gone */
     }
   }, 5000);
+  escalate.unref?.();
   r.state = 'stopped';
   r.owned = false;
   r.child = null;
@@ -631,6 +647,84 @@ function sendHtml(res, status, title, inner) {
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
+}
+
+// Decide whether a cold-hit request should get the HTML status page (a human in
+// a browser navigating) or a plain 503 (curl / XHR / webhook that wants data).
+// A real navigation sets Sec-Fetch-Mode: navigate; failing that, the request is
+// HTML only if Accept asks for text/html and did NOT lead with application/json
+// (curl sends */*, fetch/XHR that wants JSON leads with application/json).
+function wantsHtml(req) {
+  const sfm = String((req.headers && req.headers['sec-fetch-mode']) || '').toLowerCase();
+  if (sfm === 'navigate') return true;
+  const accept = String((req.headers && req.headers['accept']) || '');
+  const first = accept.split(',')[0].trim().toLowerCase();
+  return /text\/html/i.test(accept) && !first.startsWith('application/json');
+}
+
+// Map the runtime `state` (the source of truth) to a human phase word for the
+// status page. 'failed' is state==='stopped' WITH a recorded lastError; a plain
+// 'stopped' before the first probe reads as 'waking'.
+function phaseLabel(r) {
+  if (r.state === 'installing') return 'installing';
+  if (r.state === 'starting') return 'starting';
+  if (r.state === 'stopped' && r.lastError) return 'failed';
+  return 'waking';
+}
+
+// Self-refreshing HTML served on a cold navigation hit. Names the project + its
+// phase, tails the install/start log, and — unless the start already failed —
+// polls the SAME url with Accept: application/json and reloads once that stops
+// returning 503 (i.e. the port answered and the request proxied to the app).
+// `r` may be the live runtime record OR a {state, lastError} snapshot taken by
+// handleRequest before it re-kicked bring-up; only those two fields are read.
+function statusPageHtml(project, r) {
+  const host = project.host;
+  const phase = phaseLabel(r);
+  if (phase === 'failed') {
+    const reason = (r.lastError && (r.lastError.message || r.lastError.code)) || 'unknown error';
+    // Terminal page: no auto-refresh. Mirror the START_TIMEOUT copy so wording
+    // stays consistent, and offer a manual retry link to the same URL.
+    return htmlPage(
+      `${host} — failed to start`,
+      `<h1>${esc(host)} failed to start</h1>
+       <p>The dev server did not open <code>127.0.0.1:${project.port}</code> within ${Math.round(config.startTimeoutMs / 1000)}s.</p>
+       <p class="muted">${esc(reason)}</p>
+       <p>Last lines of <code>logs/${esc(host)}.log</code>:</p>
+       <pre>${esc(tailLog(host, 40))}</pre>
+       <p><a href="${esc('/')}">Retry</a></p>${dashboardHomeLink()}`
+    );
+  }
+  // Non-terminal: waking / installing / starting. Show recent log output (may be
+  // the '(no log output captured)' sentinel this early — that's fine) and a poll
+  // loop that hands off to the app without a manual reload once the port answers.
+  return htmlPage(
+    `${host} — ${phase}`,
+    `<h1>${esc(host)} is ${esc(phase)}</h1>
+     <p class="muted">lazydev is bringing this project up. This page reloads into the app automatically once it answers.</p>
+     <p>Recent output from <code>logs/${esc(host)}.log</code>:</p>
+     <pre>${esc(tailLog(host, 20))}</pre>${dashboardHomeLink()}
+     <noscript><meta http-equiv="refresh" content="2"></noscript>
+     <script>
+       // Poll the same URL asking for JSON: while bringing up, handleRequest
+       // returns 503; once the port answers the request proxies to the app and
+       // the status is no longer 503 — that edge is our cue to reload.
+       setInterval(async () => {
+         try {
+           const res = await fetch(location.href, { headers: { 'accept': 'application/json' }, cache: 'no-store' });
+           if (res.status !== 503) location.reload();
+         } catch (e) { /* daemon momentarily unreachable; keep polling */ }
+       }, 1000);
+     </script>`
+  );
+}
+
+// Cold-hit answer for non-navigation clients (curl / XHR / webhook): a plain
+// 503 with Retry-After and NO HTML body, so simple clients keep retrying and
+// the status-page poll gets its 503 signal.
+function sendRetry(res, project, r) {
+  res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '1' });
+  res.end(phaseLabel(r) + '\n');
 }
 
 // True only for loopback: IPv4 127.0.0.0/8, IPv6 ::1, and IPv4-mapped IPv6 like
@@ -973,32 +1067,49 @@ async function handleRequest(req, res) {
     );
   }
 
-  // Ensure the dev server is up, then proxy.
-  try {
-    await ensureUp(project);
-  } catch (err) {
-    if (err && err.code === 'START_TIMEOUT') {
-      return sendHtml(
-        res,
-        502,
-        'lazydev — start timed out',
-        `<h1>${esc(project.host)} failed to start</h1>
-         <p>The dev server did not open <code>127.0.0.1:${project.port}</code> within ${Math.round(config.startTimeoutMs / 1000)}s.</p>
-         <p>Last lines of <code>logs/${esc(project.host)}.log</code>:</p>
-         <pre>${esc(tailLog(project.host, 40))}</pre>${dashboardHomeLink()}`
-      );
-    }
-    return sendHtml(
-      res,
-      502,
-      'lazydev — start error',
-      `<h1>${esc(project.host)} could not start</h1><pre>${esc(String(err && err.message))}</pre>
-       <p>Log tail:</p><pre>${esc(tailLog(project.host, 40))}</pre>${dashboardHomeLink()}`
-    );
+  const r = getRuntime(project.host);
+
+  // Warm path: the project is running AND a probe/adopt already pinned the
+  // family that answered. upstreamHost is the honest "port answered" signal, so
+  // this is the only case where we proxy straight through (WS/HMR keep working).
+  if (r.state === 'running' && r.upstreamHost) {
+    lastAccess.set(project.host, Date.now());
+    return proxyHttp(req, res, project);
   }
 
-  lastAccess.set(project.host, Date.now());
-  proxyHttp(req, res, project);
+  // Cold / bringing-up path: do NOT await ensureUp — answer immediately and let
+  // the client (or the status page's poll) drive the retry.
+  //
+  // Snapshot the phase + failure reason BEFORE kicking a fresh attempt below,
+  // because kicking ensureUp synchronously clears r.lastError (fresh-attempt
+  // reset) — so a page rendered off the live record after the kick would never
+  // show the failure that just occurred. The snapshot is what the client sees;
+  // the kick starts a new bring-up behind it so a reload lands on the app.
+  const snapshot = { state: r.state, lastError: r.lastError };
+
+  // Kick bring-up in the background exactly once. ensureUp claims r.startPromise
+  // synchronously before any await (the #9cb548a fix), so calling it here and
+  // dropping the promise still yields exactly ONE child for N concurrent hits.
+  // The .catch is MANDATORY: since we no longer await, a start-timeout rejection
+  // would otherwise surface as an unhandledRejection. lastError is recorded
+  // inside ensureUp before it throws, so swallowing the rejection loses nothing.
+  if (!r.startPromise) {
+    ensureUp(project).catch(() => {});
+  }
+
+  // Navigation (browser) -> self-refreshing status page (200 so the browser
+  // renders it and runs the poll script instead of showing its own error UI).
+  // A failed start renders the failure reason + log tail in that same page.
+  if (wantsHtml(req)) {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(statusPageHtml(project, snapshot));
+    return;
+  }
+
+  // Everything else (curl / XHR / webhook, including the status page's own poll)
+  // -> plain 503 with Retry-After, no HTML. Also covers the failed state: keep
+  // it 503 so simple clients keep retrying; the failure detail is for humans.
+  return sendRetry(res, project, snapshot);
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,4 +1353,6 @@ if (RUN_AS_MAIN) {
 }
 
 // Exported for the bundled self-test (no behavior change for the daemon itself).
-export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress };
+// upstreamAgent is exposed so a test can destroy its pooled keep-alive sockets
+// on teardown (they'd otherwise keep the test process from exiting).
+export { resolveHostKey, loadConfig, inferInstallCmd, connectLoopback, probePort, LOOPBACK_HOSTS, createDaemonServer, isLoopbackAddress, wantsHtml, phaseLabel, statusPageHtml, getRuntime, ensureUp, stop, upstreamAgent };
