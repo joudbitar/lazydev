@@ -1,11 +1,39 @@
 {
   "name": "lazydev",
-  "private": true,
+  "version": "0.1.0",
+  "description": "On-demand local dev-server proxy: every project gets a permanent .localhost URL that wakes its dev server on request and sleeps it when idle.",
   "type": "module",
   "bin": {
     "lazydev": "bin/lazydev.mjs"
   },
+  "files": [
+    "bin/",
+    "lib/",
+    "lazydev.mjs",
+    "scan.mjs"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joudbitar/lazydev.git"
+  },
+  "homepage": "https://github.com/joudbitar/lazydev#readme",
+  "bugs": {
+    "url": "https://github.com/joudbitar/lazydev/issues"
+  },
+  "keywords": [
+    "dev-server",
+    "proxy",
+    "localhost",
+    "on-demand",
+    "reverse-proxy",
+    "local-development"
+  ],
+  "author": "Joud Bitar",
+  "license": "MIT"
 }
