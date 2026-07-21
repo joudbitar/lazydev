@@ -963,14 +963,34 @@ function statusPageHtml(project, r, authorized = false) {
        <p><a href="${esc('/')}">Retry</a></p>${dashboardHomeLink()}`
     );
   }
-  // Non-terminal: waking / installing / starting. Show recent log output (may be
-  // the '(no log output captured)' sentinel this early — that's fine) and a poll
-  // loop that hands off to the app without a manual reload once the port answers.
+  // Non-terminal: waking / installing / starting. A minimal centered card — a
+  // spinner, one line of copy, and a way back — plus a poll loop that hands off
+  // to the app without a manual reload once the port answers.
+  const phraseByPhase = {
+    installing: 'Installing dependencies, then starting the dev server.',
+    starting: 'The dev server is being turned on.',
+    waking: 'The dev server is being turned on.',
+  };
   return htmlPage(
     `${host} — ${phase}`,
-    `<h1>${esc(host)} is ${esc(phase)}</h1>
-     <p class="muted">lazydev is bringing this project up. This page reloads into the app automatically once it answers.</p>
-     ${logBlock(20)}${dashboardHomeLink()}
+    `<style>
+       .wake { min-height: calc(100vh - 6rem); display: flex; flex-direction: column;
+               align-items: center; justify-content: center; text-align: center; gap: 0.25rem; }
+       .spinner { width: 34px; height: 34px; border-radius: 50%; margin-bottom: 1.25rem;
+                  border: 3px solid #8884; border-top-color: #2563eb;
+                  animation: wake-spin 0.8s linear infinite; }
+       @keyframes wake-spin { to { transform: rotate(360deg); } }
+       @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+       .back { display: inline-block; margin-top: 1.75rem; padding: 0.45rem 1.1rem;
+               border: 1px solid #8886; border-radius: 8px; }
+       .back:hover { text-decoration: none; background: #8881; }
+     </style>
+     <div class="wake">
+       <div class="spinner" aria-hidden="true"></div>
+       <h1>${esc(host)}</h1>
+       <p class="muted">${phraseByPhase[phase] || phraseByPhase.waking} This page opens the app automatically once it&#39;s ready.</p>
+       <a class="back" href="http://lazydev.localhost/">&larr; Back to dashboard</a>
+     </div>
      <noscript><meta http-equiv="refresh" content="2"></noscript>
      <script>
        // Poll the same URL asking for JSON: while bringing up, handleRequest
