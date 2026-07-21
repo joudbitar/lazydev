@@ -233,18 +233,27 @@ if [ -f "${CADDYFILE}" ]; then
   mv "${TMP_CADDY}" "${CADDYFILE}"
 fi
 
-# Append the fresh, loopback-bound block wrapped in sentinel markers.
+# Append the fresh managed block wrapped in sentinel markers.
+#
+# macOS lets a non-root user bind 0.0.0.0:80 but NOT a specific loopback address
+# on :80 (127.0.0.1:80 / [::1]:80 both return EACCES), so `bind 127.0.0.1 ::1`
+# would stop Caddy from ever starting as a user LaunchAgent. Instead bind the
+# default (0.0.0.0:80, the only privileged-port bind a non-root user gets) and
+# refuse any client that is not loopback. Reachability is loopback-only either
+# way; this form actually starts without root.
 cat >> "${CADDYFILE}" <<'CADDY_EOF'
 # >>> lazydev managed block >>>
 # Managed by lazydev. *.localhost routes to the on-demand daemon on 127.0.0.1:4000.
-# Bound to loopback so nothing off this machine can reach the daemon or dev servers.
+# macOS forbids a non-root user binding a loopback address on :80 (only 0.0.0.0),
+# so bind the default and 403 any non-loopback client — loopback-only in effect.
 http://*.localhost, http://*.*.localhost {
-    bind 127.0.0.1 ::1
+    @external not remote_ip 127.0.0.0/8 ::1
+    respond @external 403
     reverse_proxy 127.0.0.1:4000
 }
 # <<< lazydev managed block <<<
 CADDY_EOF
-ok "lazydev block written to Caddyfile"
+ok "lazydev block written to Caddyfile (loopback-only via remote_ip guard)"
 
 # Reload Caddy WITHOUT sudo; fall back to a service restart.
 info "Reloading Caddy"
