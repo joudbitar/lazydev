@@ -1,0 +1,40 @@
+name: Bug report
+description: Something broke or behaved wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: How are you running lazydev
+      options:
+        - npx @jbitar/lazydev (foreground)
+        - checkout + install.sh (persistent daemon)
+        - other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+      placeholder: macOS 15.5 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: node -v
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: "npx path: ~/.local/state/lazydev/logs. Installed path: logs/ inside the checkout, or `lazydev logs <project>`."
+      render: text
