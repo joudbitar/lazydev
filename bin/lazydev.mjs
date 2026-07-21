@@ -125,7 +125,8 @@ function printSummary(projects, servePort) {
   }
   process.stdout.write(`\ndashboard: ${formatProjectUrl('lazydev', servePort)}\n`);
   process.stdout.write(`\nthis is a foreground run and stops when you press Ctrl-C.\n`);
-  process.stdout.write(`to keep it running in the background: run ./install.sh (installs the persistent, Caddy-backed daemon).\n\n`);
+  process.stdout.write(`to keep it running in the background (and lose the :port in URLs):\n`);
+  process.stdout.write(`  git clone https://github.com/joudbitar/lazydev ~/lazydev && ~/lazydev/install.sh\n\n`);
 }
 
 // Spawn the daemon in the foreground, stdio inherited. It stays attached to this
@@ -160,7 +161,8 @@ async function main() {
   // Point at the installer rather than doing it here (this path installs nothing).
   if (arg === 'install') {
     process.stdout.write(
-      'lazydev: to install the persistent background daemon, run ./install.sh from the checkout.\n' +
+      'lazydev: the persistent background daemon installs from a checkout, not from npx:\n' +
+      '  git clone https://github.com/joudbitar/lazydev ~/lazydev && ~/lazydev/install.sh\n' +
       'that path runs the daemon behind Caddy on macOS and keeps its own registry (lazydev scan).\n'
     );
     return 0;
