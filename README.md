@@ -5,7 +5,7 @@ A local proxy that starts dev servers on demand behind permanent URLs.
 You have ten projects. Each has a dev server that grabs a port and eats RAM whether or not you're using it, so you either keep fifteen terminal tabs alive or keep restarting things and guessing which port is which. lazydev's deal: every project gets a permanent URL, `http://portfolio.localhost`, and the server behind it runs only while you're actually using it.
 
 ```
-$ npx lazydev
+$ npx @jbitar/lazydev
 lazydev: scanning for projects...
 
   HOST       PORT  FRAMEWORK  STARTCMD     DIR
@@ -23,7 +23,7 @@ your projects:
 dashboard: http://lazydev.localhost:4000
 ```
 
-<!-- gif: record `npx lazydev` in a terminal, then visit a sleeping project in the browser. the tab spins a few seconds while the server boots, then the app appears. ~10s with QuickTime or Kap, crop to terminal + browser. -->
+<!-- gif: record `npx @jbitar/lazydev` in a terminal, then visit a sleeping project in the browser. the tab spins a few seconds while the server boots, then the app appears. ~10s with QuickTime or Kap, crop to terminal + browser. -->
 
 The dashboard at `http://lazydev.localhost`:
 
@@ -37,7 +37,7 @@ If portfolio's server is running, the request is piped straight through and you 
 
 Sleeping a project kills the whole process tree (pnpm, the framework under it, its workers), not just the top pid. WebSockets are piped raw, so hot-module reload works through the proxy. `tenant.myapp.localhost` routes to `myapp` with the Host header intact, so multi-tenant apps still see their subdomain. And a dev server you started yourself in a terminal gets adopted, not fought.
 
-`npx lazydev` scans your home directory for projects with a `dev` script, assigns each a free port, and serves in the foreground until Ctrl-C. All state lives in `~/.local/state/lazydev`; nothing touches your project folders, and deleting that one directory removes every trace. Anything the scan can't see (a static folder, a Python server) is one JSON entry in the registry.
+`npx @jbitar/lazydev` scans your home directory for projects with a `dev` script, assigns each a free port, and serves in the foreground until Ctrl-C. All state lives in `~/.local/state/lazydev`; nothing touches your project folders, and deleting that one directory removes every trace. Anything the scan can't see (a static folder, a Python server) is one JSON entry in the registry.
 
 ## The persistent install
 
@@ -71,7 +71,7 @@ The daemon is one Node file with zero npm dependencies: router, reverse proxy, p
 
 ## What it doesn't do
 
-- Portless URLs from npx alone; a listener on :80 means the Caddy install on macOS or CAP_NET_BIND_SERVICE on Linux. `npx lazydev` runs fine on Linux, but the installer is macOS launchd; a systemd port is the PR I'd merge first.
+- Portless URLs from npx alone; a listener on :80 means the Caddy install on macOS or CAP_NET_BIND_SERVICE on Linux. `npx @jbitar/lazydev` runs fine on Linux, but the installer is macOS launchd; a systemd port is the PR I'd merge first.
 - https, yet. The installed path is a Caddy config line away.
 - Anything except dev servers. Databases, Docker, queues, and tunnels are out of scope, and stopping idle servers is the opposite of what a production process manager wants.
 

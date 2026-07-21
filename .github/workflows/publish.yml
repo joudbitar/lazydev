@@ -1,0 +1,39 @@
+name: publish
+
+# Publishes to npm with provenance when a GitHub release is published.
+# Needs an npm granular access token (publish-only, this package only)
+# stored as the NPM_TOKEN repository secret.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write # npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm test
+      - name: publish (skips without NPM_TOKEN or if version already on npm)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN secret not set; skipping publish."
+            exit 0
+          fi
+          pkg="$(node -p 'require("./package.json").name')"
+          ver="$(node -p 'require("./package.json").version')"
+          if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+            echo "$pkg@$ver already on npm; skipping publish."
+            exit 0
+          fi
+          npm publish --provenance --access public
