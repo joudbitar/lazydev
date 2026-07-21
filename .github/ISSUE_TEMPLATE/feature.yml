@@ -1,0 +1,17 @@
+name: Feature request
+description: Something lazydev should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What should it do
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: What problem does it solve for you
+      description: The workflow that hurts today, not the solution shape.
+    validations:
+      required: true
