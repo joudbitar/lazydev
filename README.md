@@ -2,36 +2,40 @@
 
 A local proxy that starts dev servers on demand behind permanent URLs.
 
-Every project on your machine gets a stable address, `http://<name>.localhost`, whether or not its dev server is running. The first request wakes the server; thirty idle minutes put it back to sleep. You stop running `pnpm dev` in fifteen tabs, stop guessing which port is which, and stop feeding RAM to a server you opened on Tuesday.
+You have ten projects. Each has a dev server that grabs a port and eats RAM whether or not you're using it, so you either keep fifteen terminal tabs alive or keep restarting things and guessing which port is which. lazydev's deal: every project gets a permanent URL, `http://portfolio.localhost`, and the server behind it runs only while you're actually using it.
 
 ```
 $ npx lazydev
 lazydev: scanning for projects...
 
-  HOST    PORT  FRAMEWORK  STARTCMD     DIR
-  api     3010  next       pnpm dev     ~/code/api
-  blog    3020  astro      npm run dev  ~/code/blog
-  webapp  3030  vite       pnpm dev     ~/code/webapp
+  HOST       PORT  FRAMEWORK  STARTCMD     DIR
+  mixtape    3010  vite       pnpm dev     ~/code/mixtape
+  portfolio  3020  next       pnpm dev     ~/code/portfolio
+  starmap    3030  astro      npm run dev  ~/code/starmap
 
 lazydev is serving the front door on :4000 (:80 was unavailable, using :4000).
 
 your projects:
-  http://api.localhost:4000
-  http://blog.localhost:4000
-  http://webapp.localhost:4000
+  http://mixtape.localhost:4000
+  http://portfolio.localhost:4000
+  http://starmap.localhost:4000
 
 dashboard: http://lazydev.localhost:4000
 ```
 
 <!-- gif: record `npx lazydev` in a terminal, then visit a sleeping project in the browser. the tab spins a few seconds while the server boots, then the app appears. ~10s with QuickTime or Kap, crop to terminal + browser. -->
 
+The dashboard at `http://lazydev.localhost`:
+
+![the lazydev dashboard: five projects, two awake, sleep buttons for the running ones](docs/dashboard.png)
+
 ## How it works
 
-`*.localhost` resolves to your own machine by web standard, so there is nothing to configure: no /etc/hosts edits, no DNS tools, no browser proxy. lazydev listens there, reads the host name, and looks the project up in its registry, one JSON file of name, folder, port, start command.
+You open `http://portfolio.localhost`. Addresses ending in `.localhost` reach your own machine by web standard, no /etc/hosts edits, no DNS tools, so the request lands on lazydev, which reads the host name and looks `portfolio` up in its registry: one JSON file of name, folder, port, start command.
 
-If the project's server is running, the request is proxied straight through. If it's asleep, you get an instant status page while lazydev runs the start command, then it hands you to the app the moment the port answers; a Next app cold-starts in about 8 seconds on my machine, timed with curl. After 30 minutes without traffic the server is killed and its RAM freed. The URL never changes; only the process comes and goes.
+If portfolio's server is running, the request is piped straight through and you never notice lazydev was there. If it's asleep, you get an instant page with a spinner while lazydev runs the project's start command; the moment the port answers you're handed to the real app, no manual reload. A Next app cold-starts in about 8 seconds on my machine, timed with curl. Thirty minutes after the last request, the server is killed and its RAM freed. The URL keeps working; the next visit wakes it again.
 
-Hot-module reload works through the proxy, and `tenant.myapp.localhost` routes to `myapp` with the Host header intact, so multi-tenant apps still see their subdomain.
+Sleeping a project kills the whole process tree (pnpm, the framework under it, its workers), not just the top pid. WebSockets are piped raw, so hot-module reload works through the proxy. `tenant.myapp.localhost` routes to `myapp` with the Host header intact, so multi-tenant apps still see their subdomain. And a dev server you started yourself in a terminal gets adopted, not fought.
 
 `npx lazydev` scans your home directory for projects with a `dev` script, assigns each a free port, and serves in the foreground until Ctrl-C. All state lives in `~/.local/state/lazydev`; nothing touches your project folders, and deleting that one directory removes every trace. Anything the scan can't see (a static folder, a Python server) is one JSON entry in the registry.
 
@@ -62,7 +66,6 @@ lazydev restart      bounce the daemon
 The daemon is one Node file with zero npm dependencies: router, reverse proxy, process supervisor, and idle reaper in about 2,000 lines of built-ins.
 
 - Everything is loopback-only and fails closed: requests from off the machine get a 403, and the control plane requires a token the daemon mints at boot. Who serves :80 differs per platform; the reasoning is in [docs/adr/0001-npx-front-door.md](docs/adr/0001-npx-front-door.md).
-- Dev servers spawn as process-group leaders, so sleeping a project kills the whole tree with one signal: pnpm, the framework under it, its workers.
 - Health probes try `127.0.0.1` and `::1` separately, because plenty of dev servers listen on one family only.
 - `scan` merges instead of overwriting, so a rescan never clobbers the port or start command you fixed by hand.
 
