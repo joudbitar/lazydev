@@ -8,13 +8,22 @@ import { readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 
 import { join, basename, dirname } from 'node:path';
 import os from 'node:os';
 import { mergeRegistry } from './lib/registry.mjs';
+import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
 
 const HOME = os.homedir();
-// Self-locate: write the registry next to this script (project root), not a
-// hardcoded ~/.config path, so the project is relocatable. HOME below is still
-// the directory tree we SCAN for projects.
+// Self-locate: the registry lives next to this script (project root) by default,
+// not a hardcoded ~/.config path, so the project is relocatable. HOME below is
+// still the directory tree we SCAN for projects.
+//
+// When LAZYDEV_STATE_DIR is set (the npx entrypoint sets it), the registry is
+// written into that state dir instead, so scan and the daemon agree on ONE
+// location. preferXdg stays false: a bare `node scan.mjs` with no state dir
+// keeps the existing next-to-script layout. The per-path LAZYDEV_CONFIG override
+// still wins, matching the daemon's own resolution.
 const CONFIG_DIR = import.meta.dirname;
-const OUT = join(CONFIG_DIR, 'projects.json');
+const STATE_DIR = resolveStateDir({ env: process.env, home: HOME, scriptDir: CONFIG_DIR, preferXdg: false });
+const { configPath: OUT } = resolveStatePaths({ env: process.env, stateDir: STATE_DIR });
+const OUT_DIR = dirname(OUT);
 const MAXDEPTH = 4;
 
 // Heavy / irrelevant dirs we never descend into.
@@ -168,7 +177,7 @@ const out = {
   projects,
 };
 
-mkdirSync(CONFIG_DIR, { recursive: true });
+mkdirSync(OUT_DIR, { recursive: true });
 writeFileSync(OUT, JSON.stringify(out, null, 2) + '\n');
 
 // ---------------------------------------------------------------------------

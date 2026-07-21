@@ -6,33 +6,45 @@
 
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
+import { decideBindFallback, formatProjectUrl } from './lib/bind.mjs';
 
 // ---------------------------------------------------------------------------
 // Paths & constants
 // ---------------------------------------------------------------------------
 
-// Resolve all state relative to THIS file's directory, so the whole project is
-// relocatable: move or clone it anywhere and the registry, logs, and daemon
-// travel together. (Was hardcoded to ~/.config/lazydev before centralizing.)
+// This file's own directory — the next-to-script default state location, so the
+// whole project is relocatable: move or clone it anywhere and the registry,
+// logs, and daemon travel together. (Was hardcoded to ~/.config/lazydev before
+// centralizing.)
 const CONFIG_DIR = path.dirname(fileURLToPath(import.meta.url));
-// LAZYDEV_LOGS_DIR override exists solely so the bundled self-test can point the
-// daemon's log + per-project log files at a temp dir (same spirit as
-// LAZYDEV_CONFIG). Production never sets it.
-const LOGS_DIR = process.env.LAZYDEV_LOGS_DIR || path.join(CONFIG_DIR, 'logs');
-const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
-const CONFIG_PATH = process.env.LAZYDEV_CONFIG || path.join(CONFIG_DIR, 'projects.json');
 
-// The control-plane capability token lives next to the registry, so a test that
-// points LAZYDEV_CONFIG at a temp file also gets an isolated token file there.
-// (CONFIG_DIR is the module's own dir and is NOT overridable; deriving from the
-// config file's directory keeps the real repo's control-token untouched in tests.)
-const STATE_DIR = path.dirname(CONFIG_PATH);
-const CONTROL_TOKEN_PATH = process.env.LAZYDEV_CONTROL_TOKEN_PATH || path.join(STATE_DIR, 'control-token');
+// One state directory holds the registry, logs, and control token. When
+// LAZYDEV_STATE_DIR is set (the npx entrypoint sets it), all three derive from
+// it, so an npx run and a persistent install share one layout. When it is NOT
+// set, the state dir IS CONFIG_DIR — the existing next-to-script layout — so an
+// installed daemon and every existing self-test are unchanged.
+//
+// preferXdg stays false here: the daemon must not silently relocate an existing
+// install to ~/.local/state on a bare boot. The npx path opts into the XDG
+// default by resolving it (bin/lazydev.mjs) and exporting LAZYDEV_STATE_DIR
+// before this module loads.
+const STATE_DIR = resolveStateDir({ env: process.env, home: os.homedir(), scriptDir: CONFIG_DIR, preferXdg: false });
+
+// The three state paths. Each still honors its OWN override env var
+// (LAZYDEV_CONFIG / LAZYDEV_LOGS_DIR / LAZYDEV_CONTROL_TOKEN_PATH) so every
+// existing self-test hook keeps pointing its file at a temp dir; the per-path
+// override wins over the derived-from-state-dir default. The control token
+// defaults next to the registry, so a test that points LAZYDEV_CONFIG at a temp
+// file also gets an isolated token beside it.
+const { configPath: CONFIG_PATH, logsDir: LOGS_DIR, tokenPath: CONTROL_TOKEN_PATH } = resolveStatePaths({ env: process.env, stateDir: STATE_DIR });
+const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
 
 const DEFAULTS = {
   port: 4000,
@@ -229,8 +241,16 @@ function loadConfig(reason) {
     log(`config: invalid JSON in ${CONFIG_PATH} (${err.message}); keeping previous registry`);
     return false;
   }
+  // LAZYDEV_PORT forces the listen port regardless of what the registry says.
+  // The npx entrypoint sets it to 80 to serve the front door directly; applying
+  // it HERE (not just once at boot) keeps the override across config reloads
+  // (SIGHUP / control:reload) instead of snapping back to the registry's port.
+  // Production install leaves it unset, so the registry's port wins as before.
+  const envPort = Number(process.env.LAZYDEV_PORT);
   const next = {
-    port: Number.isFinite(parsed.port) ? parsed.port : DEFAULTS.port,
+    port: Number.isFinite(envPort) && envPort > 0
+      ? envPort
+      : (Number.isFinite(parsed.port) ? parsed.port : DEFAULTS.port),
     idleTimeoutMs: Number.isFinite(parsed.idleTimeoutMs) ? parsed.idleTimeoutMs : DEFAULTS.idleTimeoutMs,
     startTimeoutMs: Number.isFinite(parsed.startTimeoutMs) ? parsed.startTimeoutMs : DEFAULTS.startTimeoutMs,
     installTimeoutMs: Number.isFinite(parsed.installTimeoutMs) ? parsed.installTimeoutMs : DEFAULTS.installTimeoutMs,
@@ -1770,33 +1790,86 @@ if (RUN_AS_MAIN) {
   const REAP_INTERVAL_MS = Number(process.env.LAZYDEV_REAP_INTERVAL_MS) || 30_000;
   setInterval(reapIdle, REAP_INTERVAL_MS).unref?.();
 
-  // Bind loopback only, in two families. 127.0.0.1 is the primary front door
-  // (Caddy proxies here) — a port collision there is fatal. ::1 is best-effort:
-  // some machines have no IPv6 loopback, so a bind failure there must never take
-  // the daemon down. Nothing off this box can reach either address.
-  const primary = createDaemonServer();
-  daemonServers.push(primary);
-  primary.on('error', (err) => {
-    log(`server error (127.0.0.1): ${err && err.message}`);
-    if (err && err.code === 'EADDRINUSE') {
-      log(`FATAL: 127.0.0.1:${config.port} already in use; exiting`);
-      process.exit(1);
-    }
-  });
-  primary.listen(config.port, '127.0.0.1', () => {
-    log(`lazydev listening on 127.0.0.1:${config.port} (config=${CONFIG_PATH})`);
-    log(`dashboard: http://lazydev.localhost/  (or http://127.0.0.1:${config.port}/ with Host: lazydev.localhost)`);
-  });
+  // The numbered port to fall back to when the front-door port cannot be bound.
+  // On the npx path the front door is :80; macOS grants an unprivileged process
+  // that bind, Linux does not (no CAP_NET_BIND_SERVICE), so a plain `npx lazydev`
+  // on Linux gets EACCES and lands here. EADDRINUSE (port already held) falls back
+  // the same way. LAZYDEV_FALLBACK_PORT exists so the npx path and the self-test
+  // can force the fallback deterministically (same spirit as LAZYDEV_CONFIG).
+  const FALLBACK_PORT = Number(process.env.LAZYDEV_FALLBACK_PORT) || 4000;
 
-  const secondary = createDaemonServer();
-  daemonServers.push(secondary);
-  secondary.on('error', (err) => {
-    // Best-effort: never fatal. Keep serving on 127.0.0.1 regardless.
-    log(`note: IPv6 loopback [::1]:${config.port} unavailable (${err && err.code || err && err.message}); serving on 127.0.0.1 only`);
-  });
-  secondary.listen(config.port, '::1', () => {
-    log(`lazydev also listening on [::1]:${config.port}`);
-  });
+  // Bind ONE loopback family+port. Resolves { server } on listen, rejects with
+  // the bind error (its .code intact) on failure — the one-time error/listening
+  // pair is removed on whichever fires, so the surviving error handler below is
+  // the only one left for later runtime errors.
+  const bindOne = (server, host, port) =>
+    new Promise((resolve, reject) => {
+      const onError = (err) => {
+        server.removeListener('listening', onListening);
+        reject(err);
+      };
+      const onListening = () => {
+        server.removeListener('error', onError);
+        resolve(server);
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(port, host);
+    });
+
+  // Serve the front door directly (no Caddy). Bind 127.0.0.1 as the primary; on
+  // EACCES/EADDRINUSE fall back to the numbered port and serve there instead.
+  // ::1 is best-effort on the SAME finally-chosen port: some machines have no
+  // IPv6 loopback, so a bind failure there must never take the daemon down.
+  // Nothing off this box can reach either address (loopback bind + fail-closed
+  // guard in handleRequest/handleUpgrade).
+  (async () => {
+    let servePort = config.port;
+
+    const primary = createDaemonServer();
+    daemonServers.push(primary);
+    try {
+      await bindOne(primary, '127.0.0.1', servePort);
+    } catch (err) {
+      const decision = decideBindFallback({ attemptedPort: servePort, errorCode: err && err.code, fallbackPort: FALLBACK_PORT });
+      if (!decision.fallback) {
+        log(`FATAL: could not bind 127.0.0.1:${servePort} (${(err && err.code) || (err && err.message)}); exiting`);
+        process.exit(1);
+      }
+      log(`note: 127.0.0.1:${servePort} unavailable (${err && err.code}); falling back to :${decision.port}`);
+      servePort = decision.port;
+      try {
+        await bindOne(primary, '127.0.0.1', servePort);
+      } catch (err2) {
+        log(`FATAL: could not bind 127.0.0.1:${servePort} on fallback (${(err2 && err2.code) || (err2 && err2.message)}); exiting`);
+        process.exit(1);
+      }
+    }
+    // Later runtime errors on the primary must not crash the daemon.
+    primary.on('error', (err) => log(`server error (127.0.0.1): ${err && err.message}`));
+
+    const suffix = servePort === 80 ? '' : `:${servePort}`;
+    log(`lazydev listening on 127.0.0.1:${servePort} (config=${CONFIG_PATH})`);
+    log(`dashboard: http://lazydev.localhost${suffix}/  (or http://127.0.0.1:${servePort}/ with Host: lazydev.localhost)`);
+    // Print the front-door URLs the user should visit — with :port only when we
+    // are not on 80 (a browser reaches http://name.localhost with no suffix only
+    // on the front-door port).
+    for (const p of config.projects) {
+      if (p && p.enabled !== false) log(`  ${formatProjectUrl(p.host, servePort)}`);
+    }
+
+    const secondary = createDaemonServer();
+    daemonServers.push(secondary);
+    try {
+      await bindOne(secondary, '::1', servePort);
+      log(`lazydev also listening on [::1]:${servePort}`);
+      // Later runtime errors on ::1 must not crash the daemon either.
+      secondary.on('error', (err) => log(`server error ([::1]): ${err && err.message}`));
+    } catch (err) {
+      // Best-effort: never fatal. Keep serving on 127.0.0.1 regardless.
+      log(`note: IPv6 loopback [::1]:${servePort} unavailable (${(err && err.code) || (err && err.message)}); serving on 127.0.0.1 only`);
+    }
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -1868,4 +1941,13 @@ export {
   log,
   logFdFor,
   LOGS_DIR,
+  // #9 — npx front door: state-dir resolution + bind fallback. Re-exported from
+  // their libs so a test importing ../lazydev.mjs reaches the same helpers the
+  // daemon uses, and STATE_DIR/CONFIG_PATH expose what this module resolved.
+  resolveStateDir,
+  resolveStatePaths,
+  decideBindFallback,
+  formatProjectUrl,
+  STATE_DIR,
+  CONFIG_PATH,
 };

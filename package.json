@@ -2,6 +2,9 @@
   "name": "lazydev",
   "private": true,
   "type": "module",
+  "bin": {
+    "lazydev": "bin/lazydev.mjs"
+  },
   "scripts": {
     "test": "node --test"
   }
