@@ -21,10 +21,12 @@ test('resolveHostKey documented cases', () => {
   assert.equal(resolveHostKey('name:4000'), 'name');
   // Empty input.
   assert.equal(resolveHostKey(''), null);
-  // IPv6 bracket forms: a ']' suppresses :port stripping, so the whole bracketed
-  // string is returned. This is the current documented behavior — locked in here.
-  assert.equal(resolveHostKey('[::1]:4000'), '[::1]:4000');
-  assert.equal(resolveHostKey('[::1]'), '[::1]');
+  // IP literals name no project: they resolve to null so the daemon serves the
+  // dashboard instead of a 502 keyed on "1" or "[::1]:4000".
+  assert.equal(resolveHostKey('127.0.0.1'), null);
+  assert.equal(resolveHostKey('127.0.0.1:4000'), null);
+  assert.equal(resolveHostKey('[::1]:4000'), null);
+  assert.equal(resolveHostKey('[::1]'), null);
   // Reserved host passes through; lowercasing applies.
   assert.equal(resolveHostKey('lazydev.localhost'), 'lazydev');
   assert.equal(resolveHostKey('LAZYDEV.LOCALHOST'), 'lazydev');
