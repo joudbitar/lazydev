@@ -160,17 +160,24 @@ test('phaseLabel maps state to phase words', () => {
   assert.equal(phaseLabel({ state: 'running' }), 'waking'); // running never renders a status page
 });
 
-// --- criterion: first byte <200ms on a cold nav hit ------------------------
+// --- criterion: cold nav hit answers before the bring-up attempt settles ----
 
 test('cold navigation gets an immediate status page (no blocking on ensureUp)', async (t) => {
-  // startCmd sleeps so the port never opens -> if handleRequest awaited ensureUp
-  // the response would be delayed by startTimeoutMs. It must NOT. startTimeoutMs
-  // is kept small only so the background attempt (which we drain in cleanup)
-  // dies quickly; a blocking handler would still be an order of magnitude slower
-  // than the <200ms target, so the timing assertion is unmissable either way.
+  // startCmd sleeps so the port never opens -> the background attempt can only
+  // end by hitting startTimeoutMs. A handler that awaited ensureUp could
+  // therefore never respond before that deadline, and by the time it did,
+  // ensureUp's finally would have cleared r.startPromise and set r.lastError.
+  // That gives two load-proof assertions in place of a wall-clock target:
+  // the response must arrive while startPromise is still pending, and in under
+  // startTimeoutMs. No absolute bound like "<200ms" — under a parallel
+  // `node --test` run this response has been measured near 500ms on a loaded
+  // machine while still being perfectly non-blocking. startTimeoutMs is 3000
+  // to keep that headroom wide; cleanup drains the attempt so the wait is
+  // bounded by the same number.
+  const START_TIMEOUT_MS = 3000;
   writeConfig({
     port: 0,
-    startTimeoutMs: 800,
+    startTimeoutMs: START_TIMEOUT_MS,
     projects: [{ host: 'slow', dir: tmpDir, port: 0, startCmd: "sh -c 'sleep 30'", enabled: true }],
   });
   loadConfig('test');
@@ -180,14 +187,19 @@ test('cold navigation gets an immediate status page (no blocking on ensureUp)', 
   const port = await listen(server, '127.0.0.1');
 
   const res = await httpReq('127.0.0.1', port, { host: 'slow.localhost', accept: 'text/html', 'sec-fetch-mode': 'navigate' });
+  // Snapshot the runtime the instant the response is in hand (no awaits between).
+  const r = getRuntime('slow');
 
   assert.equal(res.status, 200, 'nav cold hit -> 200 status page');
   assert.match(res.headers['content-type'] || '', /text\/html/, 'content-type is html');
   assert.match(res.body, /slow/, 'names the project host');
   assert.match(res.body, /waking|installing|starting/, 'names a bring-up phase');
-  // The true intent: it did not block on the start path. If the handler had
-  // awaited ensureUp, this would have taken ~startTimeoutMs, not <200ms.
-  assert.ok(res.ms < 200, `first byte should arrive <200ms (took ${res.ms}ms)`);
+  // The true intent: it did not block on the start path. Blocking would mean
+  // the wake attempt already settled (startPromise null, lastError recorded)
+  // before we ever got a byte.
+  assert.ok(r.startPromise, 'bring-up attempt still in flight when the response arrived');
+  assert.equal(r.lastError, null, 'no failure recorded yet at response time');
+  assert.ok(res.ms < START_TIMEOUT_MS, `response beat the start timeout (took ${res.ms}ms, timeout ${START_TIMEOUT_MS}ms)`);
 });
 
 // --- criterion: Accept: application/json during bring-up -> 503, no HTML -----
@@ -418,6 +430,64 @@ test('WS upgrade reaches the app once running (adopt flavor)', async (t) => {
   });
 
   assert.match(handshake, /101 Switching Protocols/, 'daemon proxied the WS upgrade to the app');
+});
+
+// --- criterion: a child that dies pre-port never adopts a foreign listener ---
+
+test('child exiting before the port opens fails the start, even with a foreign listener', async (t) => {
+  // Reproduces the npx-boot flake: our spawned child exits code 1 within ms,
+  // then ANOTHER process (here a fake server; in real life a concurrent test
+  // run's dev server) starts listening on the project port. The old bare
+  // waitForPort found that foreign listener, logged "ready", and marked the
+  // project running/owned with a dead pid — wedging every later proxy on
+  // ECONNREFUSED once the foreigner left. ensureUp now races the port wait
+  // against the child's exit, so the exit must win: fast rejection carrying
+  // the exit code, no ownership claimed.
+  const probe = await fakeServer(0);
+  const projPort = probe.port;
+  await new Promise((r) => probe.server.close(r));
+
+  // The child must OUTLIVE the spawn long enough for the test to see
+  // state==='starting' and bind the foreign listener (waitForPort's probe #1
+  // fires at spawn time and must miss it), yet exit BEFORE probe #2 at +250ms —
+  // reproducing the real ordering: exit first, foreign listener found by a
+  // later probe. sleep 0.1 sits between those edges.
+  const START_TIMEOUT_MS = 5000;
+  const project = { host: 'earlyexit', dir: tmpDir, port: projPort, startCmd: "sh -c 'sleep 0.1; exit 7'", enabled: true };
+  writeConfig({ port: 0, startTimeoutMs: START_TIMEOUT_MS, projects: [project] });
+  loadConfig('test');
+
+  let foreign;
+  t.after(async () => { if (foreign) closeServer(foreign.server); await cleanup('earlyexit'); });
+
+  const attempt = ensureUp(project);
+  attempt.catch(() => {}); // re-awaited below; keep the rejection handled meanwhile
+
+  // Once the child is spawned (state 'starting' — the fresh runtime's initial
+  // state is 'stopped', so only 'starting' proves the spawn happened; the
+  // lastError arm covers a loaded machine where the child exits before our
+  // first 25ms poll), occupy the port with a foreign listener so the old
+  // code's next waitForPort probe would find it and falsely report ready.
+  const spawned = await waitFor(
+    'earlyexit',
+    (r) => r.state === 'starting' || (r.lastError && r.lastError.code === 'START_EXITED'),
+    3000
+  );
+  assert.ok(spawned, 'child spawned');
+  foreign = await fakeServer(projPort);
+
+  const started = Date.now();
+  const err = await attempt.then(() => null, (e) => e);
+  assert.ok(err, 'ensureUp rejected instead of adopting the foreign listener');
+  assert.equal(err.code, 'START_EXITED', `failure is the child exit, not a timeout (got ${err && err.code})`);
+  assert.equal(err.exitCode, 7, 'carries the child exit code');
+  assert.ok(Date.now() - started < START_TIMEOUT_MS, 'failed fast, not by riding out the start timeout');
+
+  const r = getRuntime('earlyexit');
+  assert.equal(r.state, 'stopped', 'not wedged in running');
+  assert.equal(r.owned, false, 'no ownership claimed over a dead pid');
+  assert.equal(r.pid, null, 'no stale pid retained');
+  assert.equal(r.lastError && r.lastError.code, 'START_EXITED', 'lastError records the exit for the status page');
 });
 
 // --- cleanup ----------------------------------------------------------------

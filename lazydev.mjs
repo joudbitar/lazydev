@@ -811,23 +811,64 @@ async function ensureUp(project) {
       log(`spawn-error: ${host}: ${err.message}`);
     });
 
+    // Ready means OUR child opened the port. waitForPort alone can't tell whose
+    // listener answered: if the child dies before the port opens and a foreign
+    // process (say, another test run's dev server on the same fixed port) is
+    // listening, the bare wait would mark the project running/owned with a dead
+    // pid — then every proxy ECONNREFUSEDs once the foreigner leaves, wedged in
+    // 'running'. So race the wait against the child's exit and treat any exit
+    // before the port opens — nonzero OR zero — as a failed start; a child that
+    // daemonizes and exits breaks stop/reap ownership anyway. Pre-existing
+    // listeners are still adopted, cwd-verified, by the probe BEFORE the spawn.
+    const exitedBeforeReady = new Promise((_resolve, reject) => {
+      child.once('exit', (code, signal) => {
+        const e = new Error(
+          `dev server exited (code=${code}, signal=${signal}) before opening 127.0.0.1:${project.port}`
+        );
+        e.code = 'START_EXITED';
+        e.exitCode = code;
+        e.signal = signal;
+        reject(e);
+      });
+    });
+
     try {
-      const upHost = await waitForPort(project.port, config.startTimeoutMs);
+      const upHost = await Promise.race([
+        waitForPort(project.port, config.startTimeoutMs),
+        exitedBeforeReady,
+      ]);
       r.upstreamHost = upHost; // pin the family that answered (Vite -> ::1)
       r.state = 'running';
       r.owned = true;
       log(`ready: ${host} listening on ${upHost}:${project.port}`);
     } catch (err) {
-      // Start timed out — kill the whole group and surface logs to the caller.
-      log(`start-timeout: ${host} did not open :${project.port} within ${config.startTimeoutMs}ms`);
-      killGroup(r, 'SIGKILL');
+      const exited = err && err.code === 'START_EXITED';
+      if (exited) {
+        // The 'exit' handler above already flipped the record to stopped and
+        // cleared child/pid; sweep group stragglers via the child's own pgid
+        // (killGroup reads r.pid, which is null by now).
+        log(`start-failed: ${host} ${err.message}`);
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          /* group already gone */
+        }
+      } else {
+        // Start timed out — kill the whole group and surface logs to the caller.
+        log(`start-timeout: ${host} did not open :${project.port} within ${config.startTimeoutMs}ms`);
+        killGroup(r, 'SIGKILL');
+      }
       r.state = 'stopped';
       r.owned = false;
       r.child = null;
       r.pid = null;
-      const e = new Error(`startTimeout`);
-      e.code = 'START_TIMEOUT';
+      const e = new Error(exited ? err.message : 'startTimeout');
+      e.code = exited ? 'START_EXITED' : 'START_TIMEOUT';
       e.host = host;
+      if (exited) {
+        e.exitCode = err.exitCode;
+        e.signal = err.signal;
+      }
       // Record before throwing (see install-failed site): the cold status page
       // reads r.lastError after startPromise clears in the finally below.
       r.lastError = { code: e.code, message: e.message, at: Date.now() };
