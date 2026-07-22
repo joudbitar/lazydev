@@ -15,6 +15,35 @@ import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
 import { decideBindFallback, formatProjectUrl } from './lib/bind.mjs';
 
+// The port the front door actually bound (set at boot). config.port is what we
+// ASK for; after a fallback they differ, and every URL the daemon renders must
+// carry the port that works. null until the listen succeeds (tests importing
+// this module never bind, so they render from config.port).
+let activePort = null;
+
+// The port URLs should be rendered with. The bound port is wrong whenever a
+// front-door proxy sits between the browser and the daemon: the installed path
+// has Caddy on :80 proxying to the daemon on :4000, and links must say what
+// the BROWSER can reach. The request's own Host header knows — whatever port
+// it carries (none means :80) demonstrably reaches us. Updated at request
+// entry; rendering happens inside that same request, so a mid-await overwrite
+// from a concurrent caller can only substitute another port that also works.
+let renderPort = null;
+function noteRenderPort(hostHeader) {
+  if (!hostHeader) return;
+  const h = String(hostHeader).trim();
+  // "[::1]:4000" | "name:4000" | "name" — an absent :port on an http Host
+  // header means the default port, 80.
+  const m = h.includes(']') ? h.match(/\]:(\d+)$/) : h.match(/:(\d+)$/);
+  const p = m ? Number(m[1]) : 80;
+  if (Number.isFinite(p) && p > 0) renderPort = p;
+}
+
+// Front-door URL for a host, with the :port suffix whenever we are not on :80.
+function frontUrl(host) {
+  return formatProjectUrl(host, renderPort ?? activePort ?? config.port);
+}
+
 // ---------------------------------------------------------------------------
 // Paths & constants
 // ---------------------------------------------------------------------------
@@ -126,11 +155,18 @@ function rotateIfNeeded(file, maxBytes = 1_000_000, keep = 3) {
   }
 }
 
+// LAZYDEV_QUIET=1 keeps the terminal clean: log lines go to daemon.log only.
+// The npx entrypoint sets it — it prints its own short banner, and the
+// timestamped stream stays available in the state dir. FATAL lines still hit
+// stderr so a failed boot is never silent.
+const QUIET = process.env.LAZYDEV_QUIET === '1';
+
 function log(...parts) {
   const line = `[${ts()}] ${parts.join(' ')}`;
-  // stdout
+  // stdout (stderr for FATAL when quiet — those precede an exit)
   try {
-    process.stdout.write(line + '\n');
+    if (!QUIET) process.stdout.write(line + '\n');
+    else if (String(parts[0]).startsWith('FATAL')) process.stderr.write(line + '\n');
   } catch {
     /* ignore */
   }
@@ -313,6 +349,9 @@ function resolveHostKey(hostHeader) {
   } else if (h === 'localhost') {
     return null;
   }
+  // IP literals name no project: 127.0.0.1:4000 or [::1]:4000 in the address
+  // bar should land on the dashboard, not on a project keyed "1" or "[::1]".
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h) || h.startsWith('[')) return null;
   if (!h) return null;
   const labels = h.split('.').filter(Boolean);
   if (labels.length === 0) return null;
@@ -687,8 +726,12 @@ async function ensureUp(project) {
     // Need to spawn. Install (if needed) and start are ONE atomic operation, so
     // a second concurrent request never launches a second install.
     // First start with no deps installed -> install them before starting.
+    // Only Node projects get an install step: "no node_modules" means nothing
+    // in a project that has no package.json (a static folder, a Python
+    // server), and forcing `npm install` there fails and blocks the start.
     const nodeModules = path.join(project.dir, 'node_modules');
-    if (!fs.existsSync(nodeModules)) {
+    const packageJson = path.join(project.dir, 'package.json');
+    if (!fs.existsSync(nodeModules) && fs.existsSync(packageJson)) {
       r.state = 'installing';
       const ok = await runInstall(project, r);
       if (!ok) {
@@ -888,7 +931,7 @@ function esc(s) {
 function availableList() {
   const items = config.projects
     .filter((p) => p.enabled)
-    .map((p) => `<li><a href="http://${esc(p.host)}.localhost/">http://${esc(p.host)}.localhost</a> <span class="muted">(${esc(p.framework || 'node')})</span></li>`)
+    .map((p) => `<li><a href="${esc(frontUrl(p.host))}/">${esc(frontUrl(p.host))}</a> <span class="muted">(${esc(p.framework || 'node')})</span></li>`)
     .join('');
   return `<ul>${items || '<li class="muted">no enabled projects</li>'}</ul>`;
 }
@@ -989,7 +1032,7 @@ function statusPageHtml(project, r, authorized = false) {
        <div class="spinner" aria-hidden="true"></div>
        <h1>${esc(host)}</h1>
        <p class="muted">${phraseByPhase[phase] || phraseByPhase.waking} This page opens the app automatically once it&#39;s ready.</p>
-       <a class="back" href="http://lazydev.localhost/">&larr; Back to dashboard</a>
+       <a class="back" href="${esc(frontUrl('lazydev'))}/">&larr; Back to dashboard</a>
      </div>
      <noscript><meta http-equiv="refresh" content="2"></noscript>
      <script>
@@ -1131,7 +1174,7 @@ function liveState(host, project) {
   let owned = r ? r.owned : false;
   return {
     host,
-    url: `http://${host}.localhost`,
+    url: frontUrl(host),
     port: project.port,
     enabled: project.enabled !== false,
     framework: project.framework || 'node',
@@ -1204,7 +1247,7 @@ async function handleControl(req, res, url) {
 }
 
 function dashboardHomeLink() {
-  return `<p><a href="http://lazydev.localhost/">&larr; lazydev dashboard</a></p>`;
+  return `<p><a href="${esc(frontUrl('lazydev'))}/">&larr; lazydev dashboard</a></p>`;
 }
 
 function stateBadge(state, owned) {
@@ -1253,7 +1296,7 @@ function dashboardHtml() {
         ? ` title="port held by ${esc(ls.conflictDir)}"`
         : '';
       return `<tr>
-        <td><a href="http://${esc(p.host)}.localhost/">http://${esc(p.host)}.localhost</a>${enabledNote}</td>
+        <td><a href="${esc(frontUrl(p.host))}/">${esc(frontUrl(p.host))}</a>${enabledNote}</td>
         <td>${esc(ls.framework)}</td>
         <td${stateTitle}>${stateBadge(ls.state, ls.owned)}</td>
         <td>${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
@@ -1452,23 +1495,16 @@ async function handleRequest(req, res) {
   }
 
   const hostHeader = req.headers.host || '';
+  noteRenderPort(hostHeader);
   const key = resolveHostKey(hostHeader);
   // Parse URL relative to a dummy base; we only need pathname.
   const url = new URL(req.url, 'http://localhost');
 
   // Control plane: key === lazydev OR path starts with /__lazydev/.
-  if (key === 'lazydev' || url.pathname.startsWith('/__lazydev/')) {
+  // Control plane: the lazydev host, a host naming no project (bare localhost
+  // or an IP literal — serve the dashboard rather than a 502), or /__lazydev/.
+  if (key === 'lazydev' || key === null || url.pathname.startsWith('/__lazydev/')) {
     return handleControl(req, res, url);
-  }
-
-  if (!key) {
-    return sendHtml(
-      res,
-      502,
-      'lazydev',
-      `<h1>lazydev</h1><p>No project resolved from host <code>${esc(hostHeader)}</code>.</p>
-       <p>Available projects:</p>${availableList()}`
-    );
   }
 
   const project = projectByHost(key);
@@ -1587,6 +1623,7 @@ async function handleUpgrade(req, clientSocket, head) {
   }
 
   const hostHeader = req.headers.host || '';
+  noteRenderPort(hostHeader);
   const key = resolveHostKey(hostHeader);
 
   // Never proxy the control plane over websockets.
@@ -1837,57 +1874,54 @@ if (RUN_AS_MAIN) {
       server.listen(port, host);
     });
 
-  // Serve the front door directly (no Caddy). Bind 127.0.0.1 as the primary; on
-  // EACCES/EADDRINUSE fall back to the numbered port and serve there instead.
-  // ::1 is best-effort on the SAME finally-chosen port: some machines have no
-  // IPv6 loopback, so a bind failure there must never take the daemon down.
-  // Nothing off this box can reach either address (loopback bind + fail-closed
-  // guard in handleRequest/handleUpgrade).
-  (async () => {
-    let servePort = config.port;
-
-    const primary = createDaemonServer();
-    daemonServers.push(primary);
+  // Serve the front door directly (no Caddy). One bind rule on every platform
+  // (ADR 0002): the wildcard address on the front-door port, loopback-only
+  // enforced per connection — off-box connections are destroyed at accept,
+  // and handleRequest/handleUpgrade fail closed on top of that. A wildcard
+  // bind is the one :80 a non-root process gets on macOS, it is dual-stack
+  // (no separate ::1 listener), and the guard makes it exactly as private as
+  // a loopback bind. When the OS refuses the port (Linux without the
+  // capability, or something already holds it), fall back to the numbered
+  // port, same rule.
+  const bindFrontDoor = async (server) => {
     try {
-      await bindOne(primary, '127.0.0.1', servePort);
+      await bindOne(server, undefined, config.port);
+      return config.port;
     } catch (err) {
-      const decision = decideBindFallback({ attemptedPort: servePort, errorCode: err && err.code, fallbackPort: FALLBACK_PORT });
-      if (!decision.fallback) {
-        log(`FATAL: could not bind 127.0.0.1:${servePort} (${(err && err.code) || (err && err.message)}); exiting`);
+      const code = (err && err.code) || (err && err.message);
+      const d = decideBindFallback({ attemptedPort: config.port, errorCode: err && err.code, fallbackPort: FALLBACK_PORT });
+      if (!d.fallback) {
+        log(`FATAL: could not bind :${config.port} (${code}); exiting`);
         process.exit(1);
       }
-      log(`note: 127.0.0.1:${servePort} unavailable (${err && err.code}); falling back to :${decision.port}`);
-      servePort = decision.port;
+      log(`note: :${config.port} unavailable (${code}); falling back to :${d.port}`);
       try {
-        await bindOne(primary, '127.0.0.1', servePort);
+        await bindOne(server, undefined, d.port);
+        return d.port;
       } catch (err2) {
-        log(`FATAL: could not bind 127.0.0.1:${servePort} on fallback (${(err2 && err2.code) || (err2 && err2.message)}); exiting`);
+        log(`FATAL: could not bind :${d.port} on fallback (${(err2 && err2.code) || (err2 && err2.message)}); exiting`);
         process.exit(1);
       }
     }
-    // Later runtime errors on the primary must not crash the daemon.
-    primary.on('error', (err) => log(`server error (127.0.0.1): ${err && err.message}`));
+  };
 
-    const suffix = servePort === 80 ? '' : `:${servePort}`;
-    log(`lazydev listening on 127.0.0.1:${servePort} (config=${CONFIG_PATH})`);
-    log(`dashboard: http://lazydev.localhost${suffix}/  (or http://127.0.0.1:${servePort}/ with Host: lazydev.localhost)`);
-    // Print the front-door URLs the user should visit — with :port only when we
-    // are not on 80 (a browser reaches http://name.localhost with no suffix only
-    // on the front-door port).
+  (async () => {
+    const server = createDaemonServer();
+    daemonServers.push(server);
+    // Destroy any connection that is not from loopback before a byte is read.
+    server.on('connection', (sock) => {
+      if (!isLoopbackAddress(sock.remoteAddress)) sock.destroy();
+    });
+
+    const servePort = await bindFrontDoor(server);
+    activePort = servePort;
+    // Later runtime errors must not crash the daemon.
+    server.on('error', (err) => log(`server error: ${err && err.message}`));
+
+    log(`lazydev listening on :${servePort}, loopback-only enforced per connection (config=${CONFIG_PATH})`);
+    log(`dashboard: ${frontUrl('lazydev')}/`);
     for (const p of config.projects) {
-      if (p && p.enabled !== false) log(`  ${formatProjectUrl(p.host, servePort)}`);
-    }
-
-    const secondary = createDaemonServer();
-    daemonServers.push(secondary);
-    try {
-      await bindOne(secondary, '::1', servePort);
-      log(`lazydev also listening on [::1]:${servePort}`);
-      // Later runtime errors on ::1 must not crash the daemon either.
-      secondary.on('error', (err) => log(`server error ([::1]): ${err && err.message}`));
-    } catch (err) {
-      // Best-effort: never fatal. Keep serving on 127.0.0.1 regardless.
-      log(`note: IPv6 loopback [::1]:${servePort} unavailable (${(err && err.code) || (err && err.message)}); serving on 127.0.0.1 only`);
+      if (p && p.enabled !== false) log(`  ${frontUrl(p.host)}`);
     }
   })();
 }

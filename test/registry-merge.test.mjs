@@ -20,8 +20,8 @@ const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), '../..');
 // generated command and a KNOWN host keeps its hand-edited one.
 const sanitizeHost = (name) =>
   name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-const startCmdFor = (framework, pm, port) =>
-  framework === 'vite' ? `${pm} run dev -- --port ${port} --strictPort` : `${pm} run dev`;
+const startCmdFor = (c, port) =>
+  c.framework === 'vite' ? `${c.pm} run dev -- --port ${port} --strictPort` : `${c.pm} run dev`;
 
 // Only REPO_ROOT is considered a real directory; everything else is "gone".
 const dirExists = (d) => d === REPO_ROOT;
@@ -112,6 +112,37 @@ test('never emits the reserved host (candidate literally named lazydev is remapp
   // ...and no result entry ever uses the bare reserved host.
   assert.equal(byHost(projects, 'lazydev'), undefined, 'no entry may use the reserved host');
   assert.equal(projects.filter((p) => p.host === 'lazydev').length, 0);
+});
+
+test('candidate enabled: false registers parked, and a hand-flip survives the next rescan', () => {
+  // First scan: a static-folder candidate arrives with enabled: false.
+  const candidates = [{ dir: REPO_ROOT, name: 'site', framework: 'static', enabled: false }];
+  const first = mergeRegistry({
+    existing: null,
+    candidates,
+    reservedHost: 'lazydev',
+    poolStart: 3010,
+    poolStep: 10,
+    startCmdFor,
+    sanitizeHost,
+    dirExists,
+  });
+  assert.equal(byHost(first, 'site').enabled, false, 'static candidate should start parked');
+
+  // The user flips it on by hand; the rescan rediscovers the same candidate
+  // (still carrying enabled: false) but the hand-set flag must win.
+  const existing = { projects: first.map((p) => (p.host === 'site' ? { ...p, enabled: true } : p)) };
+  const second = mergeRegistry({
+    existing,
+    candidates,
+    reservedHost: 'lazydev',
+    poolStart: 3010,
+    poolStep: 10,
+    startCmdFor,
+    sanitizeHost,
+    dirExists,
+  });
+  assert.equal(byHost(second, 'site').enabled, true, 'hand-enabled flag must survive a rescan');
 });
 
 test('carries over hand-added entries whose dir exists and drops those whose dir is gone', () => {

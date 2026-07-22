@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 // lazydev REGISTRY scanner.
-// Scans ~ for Node web projects with a `dev` script and writes/merges
-// <project-root>/projects.json per the lazydev BUILD CONTRACT (SPEC.md).
+// Scans scanRoots (default ~) for projects whose start command is provable
+// from marker files alone — Node with a `dev` script, Rails apps, Django with
+// a visible interpreter, static folders that are their own repo — and
+// writes/merges projects.json per the lazydev BUILD CONTRACT (SPEC.md).
+// Everything unprovable is the add-project skill's job, on purpose.
 // Zero npm deps — Node built-ins only.
 
 import { readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import os from 'node:os';
 import { mergeRegistry } from './lib/registry.mjs';
+import { detectRails, detectDjango, detectStatic, normalizeScanRoots } from './lib/detect.mjs';
 import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
 
 const HOME = os.homedir();
@@ -49,7 +53,7 @@ const SERVER_HINT = /\b(next|vite|astro|remix|svelte|webpack|serve|start|dev-ser
 
 // ---------------------------------------------------------------------------
 // 0. Load the existing registry up front: scan config lives there, and the
-//    merge in step 7 preserves everything it already knows.
+//    merge in step 5 preserves everything it already knows.
 // ---------------------------------------------------------------------------
 let existing = null;
 if (existsSync(OUT)) {
@@ -59,17 +63,37 @@ if (existsSync(OUT)) {
 const scanExclude = existing && Array.isArray(existing.scanExclude) ? existing.scanExclude : [];
 
 // ---------------------------------------------------------------------------
-// 1. Walk the home dir, collecting project roots (a dir with a package.json).
+// 1. Walk each scan root, collecting project roots. A row's det is null for
+//    the package.json path (validated against its dev script in step 4) and a
+//    detector result for the non-Node ecosystems.
 // ---------------------------------------------------------------------------
 const found = [];
+const seenDirs = new Set(); // scanRoots may overlap; never register a dir twice
 function walk(dir, depth) {
   if (depth > MAXDEPTH) return;
+  // scanExclude prunes the walk itself, so it holds for every ecosystem and
+  // for everything underneath the excluded path.
+  if (scanExclude.some((s) => typeof s === 'string' && s && dir.includes(s))) return;
   let entries;
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  const names = new Set(entries.map((e) => e.name));
+
+  // Detection order: rails and django before node, because manage.py and
+  // bin/rails name the app itself while a package.json next to them is asset
+  // tooling (jsbundling, vite_rails) — registering the bundler would serve
+  // the wrong process. Static runs last and never beside a package.json.
+  // Any hit is a project root: stop descending, the same rule package.json
+  // roots follow today (workspaces and embedded frontends are the
+  // add-project skill's job).
+  const det = detectRails(dir, names) || detectDjango(dir, names);
+  if (det) { addFound(dir, det); return; }
   if (entries.some((e) => e.isFile() && e.name === 'package.json')) {
-    found.push(dir);
-    return; // project root — don't descend into its packages/workspaces
+    addFound(dir, null);
+    return;
   }
+  const staticDet = detectStatic(dir, names);
+  if (staticDet) { addFound(dir, staticDet); return; }
+
   for (const e of entries) {
     if (!e.isDirectory()) continue;
     if (e.name.startsWith('.')) continue;
@@ -77,21 +101,22 @@ function walk(dir, depth) {
     walk(join(dir, e.name), depth + 1);
   }
 }
-walk(HOME, 0);
-
-// ---------------------------------------------------------------------------
-// 2. Exclusion rules (hard skips).
-// ---------------------------------------------------------------------------
-function isExcluded(dir, framework, dev) {
-  // Registry config: skip any dir whose path contains a scanExclude entry.
-  if (scanExclude.some((s) => typeof s === 'string' && s && dir.includes(s))) return true;
-  // Plain node project whose dev script doesn't look like a web/dev server.
-  if (framework === 'node' && !SERVER_HINT.test(dev)) return true;
-  return false;
+function addFound(dir, det) {
+  if (seenDirs.has(dir)) return;
+  seenDirs.add(dir);
+  found.push({ dir, det });
+}
+// scanRoots: optional registry list of extra (or replacement) scan roots,
+// default just ~. Normalization drops relative paths and nested duplicates;
+// a root that doesn't exist is skipped, not an error, so a registry shared
+// across machines still scans.
+const scanRoots = existing && Array.isArray(existing.scanRoots) ? existing.scanRoots : undefined;
+for (const root of normalizeScanRoots(scanRoots, HOME)) {
+  if (existsSync(root)) walk(root, 0);
 }
 
 // ---------------------------------------------------------------------------
-// 3. Detection helpers.
+// 2. Node detection helpers (the non-Node detectors live in lib/detect.mjs).
 // ---------------------------------------------------------------------------
 function pmOf(dir) {
   if (existsSync(join(dir, 'pnpm-lock.yaml'))) return 'pnpm';
@@ -125,34 +150,54 @@ function sanitizeHost(name) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Build candidate rows.
+// 3. Build candidate rows. Detector rows pass through as-is; package.json
+//    rows still have to prove themselves with a dev script that looks like a
+//    web server.
 // ---------------------------------------------------------------------------
 const candidates = [];
-for (const dir of found) {
+for (const { dir, det } of found) {
+  if (det) {
+    candidates.push({ dir, name: basename(dir), ...det });
+    continue;
+  }
   let pkg;
   try { pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')); } catch { continue; }
   const dev = pkg.scripts && pkg.scripts.dev;
   if (!dev) continue;
   const framework = frameworkOf(pkg);
-  if (isExcluded(dir, framework, dev)) continue;
+  // Plain node project whose dev script doesn't look like a web/dev server.
+  if (framework === 'node' && !SERVER_HINT.test(dev)) continue;
   candidates.push({ dir, name: basename(dir), pm: pmOf(dir), framework, dev });
 }
 
 // ---------------------------------------------------------------------------
-// 5. Generate startCmd.
+// 4. Generate startCmd from a candidate row.
 //    Vite-based: "<pmrun> -- --port <port> --strictPort".
-//    PORT-env (next/cra/node): just "<pmrun>" (daemon injects PORT).
+//    PORT-env (next/cra/node/static): daemon injects PORT, no port in the cmd.
+//    django/rails ignore PORT, so the port is written into the command.
 // ---------------------------------------------------------------------------
-function startCmdFor(framework, pm, port) {
-  const run = pmRun(pm);
-  if (VITE_BASED.has(framework)) {
+function startCmdFor(c, port) {
+  switch (c.framework) {
+    case 'django':
+      // Interpreter is evidence-derived (lib/detect.mjs), relative to the
+      // project dir the daemon uses as cwd.
+      return `${c.interpreter} manage.py runserver 127.0.0.1:${port}`;
+    case 'rails':
+      return `bin/rails server -p ${port}`;
+    case 'static':
+      // serve_static.py reads PORT from the env. Quoted because the npx
+      // cache path this checkout may live in can contain spaces.
+      return `python3 "${join(CONFIG_DIR, 'serve_static.py')}"`;
+  }
+  const run = pmRun(c.pm);
+  if (VITE_BASED.has(c.framework)) {
     return `${run} -- --port ${port} --strictPort`;
   }
   return run;
 }
 
 // ---------------------------------------------------------------------------
-// 6. Merge with the existing registry (loaded in step 0): assign unique hosts
+// 5. Merge with the existing registry (loaded in step 0): assign unique hosts
 //    (never RESERVED_HOST), preserve port/enabled/startCmd for known hosts,
 //    fresh ports only for new hosts, and carry over hand-added entries whose
 //    directory still exists. The merge itself is pure (lib/registry.mjs); we
@@ -174,6 +219,9 @@ const out = {
   idleTimeoutMs: existing && Number.isFinite(existing.idleTimeoutMs) ? existing.idleTimeoutMs : 1800000,
   startTimeoutMs: existing && Number.isFinite(existing.startTimeoutMs) ? existing.startTimeoutMs : 120000,
   ...(scanExclude.length ? { scanExclude } : {}),
+  // scanRoots is preserved exactly as the user wrote it (unnormalized), so a
+  // rescan never rewrites hand-edited config.
+  ...(scanRoots ? { scanRoots } : {}),
   projects,
 };
 
@@ -181,8 +229,12 @@ mkdirSync(OUT_DIR, { recursive: true });
 writeFileSync(OUT, JSON.stringify(out, null, 2) + '\n');
 
 // ---------------------------------------------------------------------------
-// 7. Report.
+// 6. Report. LAZYDEV_SCAN_QUIET=1 (set by the npx entrypoint, which prints its
+//    own banner from the registry) skips the table; a direct `node scan.mjs`
+//    or `lazydev scan` keeps it.
 // ---------------------------------------------------------------------------
+if (process.env.LAZYDEV_SCAN_QUIET === '1') process.exit(0);
+
 const tilde = (p) => p.replace(HOME, '~');
 const rows = [...projects].sort((a, b) => a.port - b.port);
 const w = {
@@ -202,4 +254,9 @@ for (const r of rows) {
     r.framework.padEnd(w.fw) + '  ' + r.startCmd.padEnd(w.cmd) + '  ' + tilde(r.dir)
   );
 }
-console.log(`\nTotal: ${rows.length} projects.\n`);
+const parked = rows.filter((r) => r.enabled === false).length;
+console.log(`\nTotal: ${rows.length} projects.`);
+if (parked) {
+  console.log(`${parked} parked with "enabled": false (static folders start parked). Flip the flag in ${tilde(OUT)} to serve them.`);
+}
+console.log('');

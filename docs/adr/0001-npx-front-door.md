@@ -1,6 +1,10 @@
 # ADR 0001: the front door, per platform
 
-Status: accepted (2026-07-21)
+Status: accepted (2026-07-21). The npx bind decision ("it never binds
+`0.0.0.0`") is superseded by ADR 0002, which binds the wildcard address on
+macOS with a per-connection loopback guard. The try/install split (npx as a
+throwaway foreground run, the persistent daemon as a separate clone +
+install.sh path) is superseded by ADR 0003: one command does both.
 
 ## Context
 
