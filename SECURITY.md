@@ -6,14 +6,13 @@ lazydev proxies browser traffic to dev servers on your own machine and starts th
 
 Nothing off your machine can reach lazydev or anything behind it.
 
-- The npx path binds loopback only (`127.0.0.1` and `::1`). It never binds `0.0.0.0`.
-- The installed path puts Caddy on `0.0.0.0:80`, because macOS refuses a non-root loopback bind on :80. Two guards compensate, both fail closed: Caddy answers 403 to any client that is not loopback, and the daemon independently checks that every request and WebSocket upgrade arrived on a loopback address and 403s the rest. A mistake in one layer does not expose you.
+- The daemon binds the wildcard address on :80, because macOS refuses a non-root loopback bind there (ADR 0002). Two guards compensate, both fail closed: a connection whose remote address is not loopback is destroyed at accept before a byte is read, and every request and WebSocket upgrade that gets further is independently checked and 403d unless it arrived on a loopback address. A LAN port scan sees an open port that never answers. A mistake in one layer does not expose you.
 - The control plane (the endpoints that wake, sleep, restart, or reconfigure projects) requires a capability token the daemon mints at boot, stored with mode 600 in the state directory, plus a same-origin check. That is the defense against a malicious web page driving `localhost:4000` from inside your own browser.
 - No telemetry, no outbound network traffic, no sudo anywhere.
 
 ## Supply chain
 
-The published package has zero npm dependencies: nine files, about 36 kB, all from this repository. Releases are published from GitHub Actions with npm provenance, so the npm page links every version to the public commit it was built from. CI runs the test suite on every push, on macOS and Linux.
+The published package has zero npm dependencies: 16 files, all from this repository (`npm pack --dry-run` lists them). Releases are published from GitHub Actions with npm provenance, so the npm page links every version to the public commit it was built from. CI runs the test suite on every push, on macOS and Linux.
 
 ## What it does not defend against
 

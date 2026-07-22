@@ -10,7 +10,9 @@
     "bin/",
     "lib/",
     "lazydev.mjs",
-    "scan.mjs"
+    "scan.mjs",
+    "serve_static.py",
+    ".claude/skills/"
   ],
   "engines": {
     "node": ">=20"

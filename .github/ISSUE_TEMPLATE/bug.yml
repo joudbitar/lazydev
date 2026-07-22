@@ -14,8 +14,8 @@ body:
     attributes:
       label: How are you running lazydev
       options:
-        - npx @jbitar/lazydev (foreground)
-        - checkout + install.sh (persistent daemon)
+        - npx @jbitar/lazydev / installed lazydev (background service)
+        - foreground run (CI, Linux, LAZYDEV_NO_INSTALL)
         - other
     validations:
       required: true

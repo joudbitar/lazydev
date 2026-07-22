@@ -17,5 +17,7 @@ daemon.err
 
 .DS_Store
 
-# Claude Code worktrees / workflow scratch
-.claude/
+# Claude Code local state (worktrees, scratch). The add-project skill under
+# .claude/skills/ is shipped product, not scratch — it stays tracked.
+.claude/*
+!.claude/skills/
