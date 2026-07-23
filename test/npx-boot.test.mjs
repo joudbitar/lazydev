@@ -92,6 +92,21 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
 
   const frontPort = await freePort();
 
+  // Pin the demo project's dev-server port to a per-run free port BEFORE the
+  // scan runs. Concurrent copies of this suite each used to get the SAME pool
+  // port (3010) from mergeRegistry, so one run's dev server held the port while
+  // the others' died on EADDRINUSE — and worse, waitForPort then saw the
+  // winner's listener and declared the loser "ready". Pre-planting
+  // { host, dir, port } goes through the registry's documented hand-edit path:
+  // scan preserves a known host's port but still derives startCmd itself, so
+  // the discovery assertion below can tell a real scan hit (startCmd present)
+  // from a mere carry-over of this stub (startCmd absent).
+  const devPort = await freePort();
+  fs.writeFileSync(
+    path.join(stateDir, 'projects.json'),
+    JSON.stringify({ projects: [{ host: 'demoapp', dir: projDir, port: devPort }] })
+  );
+
   const child = spawn(process.execPath, [BIN], {
     cwd: ROOT,
     env: {
@@ -110,6 +125,13 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
   child.stdout.on('data', (d) => (out += d));
   child.stderr.on('data', (d) => (out += d));
 
+  // Terminal signal for the polls below: once the entrypoint is gone there is
+  // nothing left to wait for, however much deadline remains.
+  let exited = false;
+  child.once('exit', () => {
+    exited = true;
+  });
+
   t.after(async () => {
     try {
       child.kill('SIGINT');
@@ -127,11 +149,15 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
   });
 
   // Wait for the daemon to answer on the front port (dashboard control plane).
+  // Generous cap: under a parallel `node --test` load the boot (spawn + scan +
+  // bind) stretches well past any "reasonable" figure while still being fine.
+  // A dead entrypoint ends the wait immediately instead of burning the cap.
   const up = await poll(async () => {
+    if (exited) return { exited: true };
     const r = await get('lazydev.localhost', frontPort);
     return r && r.status ? r : null;
-  }, 10000);
-  assert.ok(up, `daemon should answer on 127.0.0.1:${frontPort}\n--- child output ---\n${out}`);
+  }, 30000);
+  assert.ok(up && up.status, `daemon should answer on 127.0.0.1:${frontPort}\n--- child output ---\n${out}`);
 
   // The scan wrote the registry INTO the state dir (not the checkout, not the
   // project dir), and it discovered our planted project.
@@ -140,14 +166,47 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
   const reg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
   const demo = (reg.projects || []).find((p) => p.host === 'demoapp');
   assert.ok(demo, `planted project discovered by scan (got hosts: ${(reg.projects || []).map((p) => p.host).join(',')})`);
+  // The pre-planted stub had NO startCmd; only a real scan discovery derives
+  // one. This keeps the assertion meaning "the walk found the project", not
+  // "the stub survived the merge as a carry-over".
+  assert.equal(typeof demo.startCmd, 'string', 'scan derived a startCmd (discovery, not carry-over)');
+  assert.equal(demo.port, devPort, 'scan preserved the pre-planted per-run port');
 
   // Hit the project through the daemon: the first cold hit spawns the dev server
   // (cwd == projDir, so no adopt/conflict), then subsequent hits proxy to it.
-  const proxied = await poll(async () => {
+  //
+  // No absolute wall-clock deadline here: with three `npm test` suites running
+  // concurrently the planted dev server has taken >12s just to open its port
+  // while everything still worked. The honest bound is the daemon's OWN
+  // bring-up deadline — scan wrote startTimeoutMs into the registry and
+  // ensureUp waits exactly that long for the port — so poll up to that plus
+  // headroom for the proxy hop. Real failures don't wait it out: the moment
+  // the daemon records a terminal verdict in daemon.log (start-timeout /
+  // spawn-error) or the entrypoint dies, the poll ends and the assert shows
+  // the verdict. What the test proves is unchanged; only the deadline now
+  // scales with the daemon's instead of guessing a wall-clock figure.
+  const startTimeoutMs = Number.isFinite(reg.startTimeoutMs) ? reg.startTimeoutMs : 120000;
+  const daemonLogPath = path.join(stateDir, 'logs', 'daemon.log');
+  const readDaemonLog = () => {
+    try {
+      return fs.readFileSync(daemonLogPath, 'utf8');
+    } catch {
+      return '';
+    }
+  };
+  const outcome = await poll(async () => {
+    if (exited) return { fail: 'entrypoint exited before the proxy came up' };
+    const verdict = readDaemonLog().match(/(?:start-timeout|spawn-error): demoapp[^\n]*/);
+    if (verdict) return { fail: `daemon gave up on the dev server: ${verdict[0]}` };
     const r = await get('demoapp.localhost', frontPort);
-    return r && r.status === 200 && r.body === 'DEMO-OK' ? r : null;
-  }, 12000);
-  assert.ok(proxied, `proxy reached the spawned dev server at demoapp.localhost:${frontPort}\n--- child output ---\n${out}`);
+    return r && r.status === 200 && r.body === 'DEMO-OK' ? { res: r } : null;
+  }, startTimeoutMs + 10000);
+  assert.ok(
+    outcome && outcome.res,
+    `proxy reached the spawned dev server at demoapp.localhost:${frontPort}` +
+      (outcome && outcome.fail ? `\n--- terminal verdict ---\n${outcome.fail}` : '') +
+      `\n--- daemon.log ---\n${readDaemonLog()}\n--- child output ---\n${out}`
+  );
 
   // Nothing was written into the project directory beyond what we planted: no
   // registry, no control token, no logs dir leaked into it.
@@ -159,16 +218,13 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
   assert.ok(fs.existsSync(path.join(stateDir, 'control-token')), 'control token in the state dir');
   assert.ok(fs.existsSync(path.join(stateDir, 'logs')), 'logs dir in the state dir');
 
-  // SIGINT stops the daemon cleanly (its own handler exits 0). Give it a moment
-  // and assert the process ended without us having to SIGKILL.
+  // SIGINT stops the daemon cleanly (its own handler exits 0). The claim is
+  // "exits on SIGINT", not "exits fast" — the cap only exists so a hung
+  // handler can't stall the suite, so keep it wide enough for a loaded box.
   child.kill('SIGINT');
-  const exited = await new Promise((resolve) => {
-    let done = false;
-    child.once('exit', () => {
-      done = true;
-      resolve(true);
-    });
-    setTimeout(() => resolve(done), 3000);
+  const sigintExited = await new Promise((resolve) => {
+    child.once('exit', () => resolve(true));
+    setTimeout(() => resolve(exited), 10000).unref?.();
   });
-  assert.ok(exited, 'entrypoint exits on SIGINT');
+  assert.ok(sigintExited, 'entrypoint exits on SIGINT');
 });
