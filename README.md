@@ -64,6 +64,8 @@ The dashboard at `http://lazydev.localhost` is the control surface: every projec
 
 ```
 lazydev              rescan for new projects and refresh the install
+lazydev logs <host>  tail a project's dev-server log (why did it fail to start?)
+lazydev install      force a full reinstall, rebaking the service PATH from this shell
 lazydev uninstall    stop the service and remove every trace
 ```
 

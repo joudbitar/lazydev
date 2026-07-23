@@ -4,6 +4,7 @@
 //   npx @jbitar/lazydev        first run: ask consent, scan ~, install the
 //                              background service, print the URLs, exit
 //   lazydev                    (the installed command) rescan + refresh
+//   lazydev logs <host>        tail a project's dev-server log
 //   lazydev uninstall          stop the service and remove every trace
 //
 // Interactive runs on macOS install a user LaunchAgent (no sudo) so the URLs
@@ -29,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from '../lib/state.mjs';
 import { decideBindFallback, formatProjectUrl } from '../lib/bind.mjs';
 import { makeStyler, makeSpinner, LOGO } from '../lib/ui.mjs';
-import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory } from '../lib/install.mjs';
+import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, toolsToVerify } from '../lib/install.mjs';
 
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
 
@@ -256,15 +257,27 @@ function launchctl(args) {
   return spawnSync('launchctl', args, { stdio: 'ignore' }).status === 0;
 }
 
+// Async twin for the install path. The spinner redraws on an event-loop timer,
+// so any spawnSync under it freezes the animation mid-frame; everything that
+// runs while a spinner is up must yield. Uninstall keeps the sync one — it has
+// no spinner to starve.
+function launchctlAsync(args) {
+  return new Promise((resolve) => {
+    const c = spawn('launchctl', args, { stdio: 'ignore' });
+    c.on('error', () => resolve(false));
+    c.on('exit', (code) => resolve(code === 0));
+  });
+}
+
 // Copy the running package into the state dir. npx runs from a cache that can
 // be pruned at any time, so the LaunchAgent must point at a copy we own. The
 // list comes from package.json "files" — exactly what the published package
 // ships — because a checkout has more (tests, docs, .git) that must NOT be
 // dragged along.
-function copyApp() {
+async function copyApp() {
   if (fs.existsSync(APP_DIR) && fs.realpathSync(APP_DIR) === fs.realpathSync(ROOT)) return; // running from the installed copy
-  fs.rmSync(APP_DIR, { recursive: true, force: true });
-  fs.mkdirSync(APP_DIR, { recursive: true });
+  await fs.promises.rm(APP_DIR, { recursive: true, force: true });
+  await fs.promises.mkdir(APP_DIR, { recursive: true });
   let files = ['bin', 'lib', 'lazydev.mjs', 'scan.mjs'];
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
@@ -272,7 +285,18 @@ function copyApp() {
   } catch { /* fall back to the core list */ }
   for (const entry of [...files, 'package.json']) {
     const src = path.join(ROOT, entry);
-    if (fs.existsSync(src)) fs.cpSync(src, path.join(APP_DIR, entry), { recursive: true });
+    if (fs.existsSync(src)) await fs.promises.cp(src, path.join(APP_DIR, entry), { recursive: true });
+  }
+}
+
+// The version of the copy the LaunchAgent runs, or null when nothing is
+// installed. A re-run compares this against its own VERSION to decide whether
+// the daemon needs replacing at all.
+function installedVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(APP_DIR, 'package.json'), 'utf8')).version;
+  } catch {
+    return null;
   }
 }
 
@@ -281,15 +305,10 @@ async function installPersistent({ onStep = () => {} } = {}) {
 
   // Stop any existing agent first (this label covers the old checkout install
   // too, so an npx install cleanly supersedes it), then refresh the app copy.
-  launchctl(['bootout', `${domain}/${LAUNCHD_LABEL}`]);
-  copyApp();
+  await launchctlAsync(['bootout', `${domain}/${LAUNCHD_LABEL}`]);
+  await copyApp();
 
   const nodeBin = process.execPath;
-  const toolDirs = [path.dirname(nodeBin)];
-  for (const tool of ['npm', 'pnpm', 'yarn', 'bun']) {
-    const p = which(tool);
-    if (p) toolDirs.push(path.dirname(p));
-  }
   const plist = renderPlist({
     nodeBin,
     daemonPath: path.join(APP_DIR, 'lazydev.mjs'),
@@ -297,22 +316,28 @@ async function installPersistent({ onStep = () => {} } = {}) {
     stateDir,
     logsDir,
     home: os.homedir(),
-    pathEnv: assembleLaunchdPath({ toolDirs, home: os.homedir() }),
+    // The daemon must resolve every project's start command to the same binary
+    // the user's shell would — so it inherits this install shell's PATH.
+    pathEnv: assembleLaunchdPath({
+      userPath: process.env.PATH || '',
+      nodeDir: path.dirname(nodeBin),
+      home: os.homedir(),
+    }),
     frontPort: FRONT_PORT,
     fallbackPort: FALLBACK_PORT,
   });
   fs.mkdirSync(path.dirname(PLIST_PATH), { recursive: true });
   fs.writeFileSync(PLIST_PATH, plist);
 
-  if (!launchctl(['bootstrap', domain, PLIST_PATH])) {
+  if (!(await launchctlAsync(['bootstrap', domain, PLIST_PATH]))) {
     // Legacy fallback, same as the old installer.
-    launchctl(['unload', PLIST_PATH]);
-    if (!launchctl(['load', '-w', PLIST_PATH])) {
+    await launchctlAsync(['unload', PLIST_PATH]);
+    if (!(await launchctlAsync(['load', '-w', PLIST_PATH]))) {
       throw new Error(`launchctl could not load ${PLIST_PATH}`);
     }
   }
-  launchctl(['enable', `${domain}/${LAUNCHD_LABEL}`]);
-  launchctl(['kickstart', '-k', `${domain}/${LAUNCHD_LABEL}`]);
+  await launchctlAsync(['enable', `${domain}/${LAUNCHD_LABEL}`]);
+  await launchctlAsync(['kickstart', '-k', `${domain}/${LAUNCHD_LABEL}`]);
 
   // Put `lazydev` on PATH: a symlink to this same entrypoint in the app copy.
   fs.mkdirSync(path.dirname(CLI_LINK), { recursive: true });
@@ -323,9 +348,9 @@ async function installPersistent({ onStep = () => {} } = {}) {
   // exists). Replaced wholesale on every install so it tracks the daemon.
   let skillInstalled = false;
   if (fs.existsSync(SKILL_SRC) && fs.existsSync(path.join(os.homedir(), '.claude'))) {
-    fs.rmSync(SKILL_DEST, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(SKILL_DEST), { recursive: true });
-    fs.cpSync(SKILL_SRC, SKILL_DEST, { recursive: true });
+    await fs.promises.rm(SKILL_DEST, { recursive: true, force: true });
+    await fs.promises.mkdir(path.dirname(SKILL_DEST), { recursive: true });
+    await fs.promises.cp(SKILL_SRC, SKILL_DEST, { recursive: true });
     skillInstalled = true;
   }
 
@@ -341,12 +366,12 @@ async function installPersistent({ onStep = () => {} } = {}) {
   return { up: false, port: FRONT_PORT, skillInstalled };
 }
 
-function printInstalledBanner({ projects, port, startedAt, skillInstalled }) {
+function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb = 'installed' }) {
   const { bold, dim, cyan } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
   const readyMs = Date.now() - startedAt;
   out();
-  out(`  ${cyan(bold('lazydev'))} ${dim(`v${VERSION}`)}  installed ${dim(`in ${readyMs} ms`)}`);
+  out(`  ${cyan(bold('lazydev'))} ${dim(`v${VERSION}`)}  ${verb} ${dim(`in ${readyMs} ms`)}`);
   out();
   if (!projects.length) {
     out(`  no projects found under ${tilde(os.homedir())}.`);
@@ -508,6 +533,194 @@ function runDaemon(env) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool preflight. The daemon resolves start commands under the plist PATH,
+// not the user's shell PATH. Those must agree BINARY BY BINARY, not just
+// name by name: the tradepulse incident was two pnpms on one machine —
+// /usr/local/bin/pnpm (v9, rejects a config-only pnpm-workspace.yaml) ahead
+// of ~/.npm-global/bin/pnpm (v10, the one the shell ran) — so the daemon
+// crash-looped a project the user's own terminal started fine, and nothing
+// said why until someone read the log. A version probe can't catch that
+// class (both pnpms pass --version); resolving each tool under BOTH paths
+// and comparing does, at install time, while the user is still watching.
+// ---------------------------------------------------------------------------
+
+// Tools whose `--version` is a cheap, universal liveness probe (catches the
+// genuinely-broken-binary case). Anything not listed only gets resolution
+// checks — an arbitrary tool may not know the flag, and a false "broken" is
+// worse than a missed one.
+const VERSION_PROBED = new Set(['npm', 'pnpm', 'yarn', 'bun', 'node', 'python3', 'uv', 'poetry']);
+
+// Resolve `tool` under `pathEnv`; optionally prove the resolved binary runs.
+// Distinct exit codes keep "missing" (40) and "broken" (41) apart.
+function probeTool(tool, pathEnv, withVersion) {
+  return new Promise((resolve) => {
+    const script = withVersion
+      ? `p="$(command -v ${tool})" || exit 40; echo "$p"; "$p" --version >/dev/null 2>&1 || exit 41`
+      : `command -v ${tool} || exit 40`;
+    const c = spawn('sh', ['-c', script], {
+      env: { ...process.env, PATH: pathEnv },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let outBuf = '';
+    c.stdout.on('data', (d) => (outBuf += d));
+    const timer = setTimeout(() => {
+      try { c.kill('SIGKILL'); } catch { /* already gone */ }
+    }, 8000);
+    const done = (result) => { clearTimeout(timer); resolve(result); };
+    c.on('error', () => done({ code: 40, bin: null }));
+    c.on('exit', (code) => {
+      done({ code, bin: outBuf.trim().split('\n')[0] || null });
+    });
+  });
+}
+
+async function checkTool(tool, servicePath) {
+  const [service, shell] = await Promise.all([
+    probeTool(tool, servicePath, VERSION_PROBED.has(tool)),
+    probeTool(tool, process.env.PATH || '', false),
+  ]);
+  if (service.code === 40 || (service.code !== 0 && service.code !== 41)) {
+    return { tool, ok: false, reason: 'missing' };
+  }
+  if (service.code === 41) {
+    return { tool, ok: false, reason: 'broken', bin: service.bin };
+  }
+  if (shell.code === 0 && shell.bin && service.bin && shell.bin !== service.bin) {
+    // fs.realpathSync both sides before declaring divergence: a symlinked dir
+    // (say /usr/local/bin -> /opt/tools) makes different strings name the
+    // same binary, and that must not warn.
+    try {
+      if (fs.realpathSync(shell.bin) === fs.realpathSync(service.bin)) {
+        return { tool, ok: true, bin: service.bin };
+      }
+    } catch { /* unreadable link — treat as divergent and warn */ }
+    return { tool, ok: false, reason: 'mismatch', bin: service.bin, shellBin: shell.bin };
+  }
+  return { tool, ok: true, bin: service.bin };
+}
+
+function preflightTools(tools, servicePath) {
+  return Promise.all(tools.map((t) => checkTool(t, servicePath)));
+}
+
+// The PATH the daemon is REALLY running with: the deployed plist's, when one
+// is installed. Preflighting the plist we would write instead of the plist
+// that exists would miss the stale case — a shell PATH that changed since
+// install, with the service still resolving yesterday's binaries.
+function deployedPathEnv() {
+  try {
+    const m = fs.readFileSync(PLIST_PATH, 'utf8').match(/<key>PATH<\/key>\s*<string>([^<]*)<\/string>/);
+    if (m && m[1]) return m[1];
+  } catch { /* no plist yet — fresh install */ }
+  return assembleLaunchdPath({
+    userPath: process.env.PATH || '',
+    nodeDir: path.dirname(process.execPath),
+    home: os.homedir(),
+  });
+}
+
+function printToolWarnings(results) {
+  const bad = results.filter((r) => !r.ok);
+  if (!bad.length) return;
+  const { bold, dim, red } = ui;
+  const out = (s = '') => process.stdout.write(s + '\n');
+  for (const r of bad) {
+    if (r.reason === 'mismatch') {
+      out(`  ${red('⚠')} ${bold(r.tool)}: the service runs ${tilde(r.bin)}, your shell runs ${tilde(r.shellBin)}.`);
+      out(dim(`    two installs of one tool can behave differently — \`lazydev install\` rebakes the service PATH from this shell.`));
+    } else if (r.reason === 'broken') {
+      out(`  ${red('⚠')} ${bold(r.tool)} resolves to ${tilde(r.bin || '?')} for the service, but \`${r.tool} --version\` fails there.`);
+      out(dim(`    projects whose start command uses ${r.tool} will not come up until this is fixed.`));
+    } else {
+      out(`  ${red('⚠')} ${bold(r.tool)} is not on the service PATH — projects that start with it will not come up.`);
+    }
+  }
+  out();
+}
+
+// ---------------------------------------------------------------------------
+// logs — the command the daemon's status page points users at. The browser
+// page redacts log tails (they leak filesystem paths to any caller without the
+// control token); this reads the same file locally, where the user's own shell
+// IS the authorization. Kept dependency-free and daemon-free on purpose: logs
+// must be readable precisely when the daemon is wedged or dead.
+// ---------------------------------------------------------------------------
+
+function cmdLogs(args) {
+  const { bold, dim } = ui;
+  const out = (s = '') => process.stdout.write(s + '\n');
+  const rest = args.filter((a) => a !== 'logs');
+
+  // -n N: how many trailing lines (default 40, same tail the status page shows
+  // an authorized caller).
+  let lines = 40;
+  const nAt = rest.indexOf('-n');
+  if (nAt !== -1) {
+    const v = Number(rest[nAt + 1]);
+    if (Number.isFinite(v) && v > 0) lines = Math.floor(v);
+    rest.splice(nAt, 2);
+  }
+
+  const raw = rest.find((a) => !a.startsWith('-')) || '';
+  // Accept the URL form too: `lazydev logs tradepulse.localhost`.
+  const host = raw.replace(/\.localhost$/, '');
+
+  const available = () => {
+    try {
+      return fs.readdirSync(logsDir).filter((f) => /\.(log|err)$/.test(f)).sort();
+    } catch {
+      return [];
+    }
+  };
+
+  const listAvailable = () => {
+    const names = available();
+    if (!names.length) {
+      out(dim(`  no logs yet in ${tilde(logsDir)} — a project writes its log on first start.`));
+      return;
+    }
+    out(dim(`  logs in ${tilde(logsDir)}:`));
+    for (const f of names) out(`    ${f.replace(/\.log$/, '')}`);
+  };
+
+  out();
+  if (!host || host.includes('/') || host.includes('..')) {
+    out(`  usage: ${bold('lazydev logs <host>')} ${dim('[-n lines]')}`);
+    out();
+    listAvailable();
+    out();
+    return host ? 1 : 0;
+  }
+
+  // `lazydev logs daemon` reads the daemon's own log; everything else is a
+  // per-project log written by that project's dev server.
+  const file = path.join(logsDir, `${host}.log`);
+  if (!fs.existsSync(file)) {
+    out(`  no log for ${bold(host)} yet.`);
+    out();
+    listAvailable();
+    out();
+    return 1;
+  }
+
+  let content = '';
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    process.stderr.write(`lazydev: could not read ${file}: ${err.message}\n`);
+    return 1;
+  }
+  const all = content.split('\n');
+  if (all[all.length - 1] === '') all.pop(); // trailing newline is not a line
+  const tail = all.slice(-lines);
+  out(`  ${tilde(file)} ${dim(`— last ${tail.length} of ${all.length} lines`)}`);
+  out();
+  for (const l of tail) out(l);
+  out();
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -517,8 +730,9 @@ async function main() {
   const cmd = args.find((a) => !a.startsWith('-')) || '';
 
   if (cmd === 'uninstall') return uninstall({ assumeYes });
+  if (cmd === 'logs') return cmdLogs(args.slice(args.indexOf('logs') + 1));
   if (cmd && cmd !== 'install') {
-    process.stderr.write(`lazydev: unknown command "${cmd}". run with no arguments to install/rescan, or \`lazydev uninstall\`.\n`);
+    process.stderr.write(`lazydev: unknown command "${cmd}". run with no arguments to install/rescan, \`lazydev logs <host>\`, or \`lazydev uninstall\`.\n`);
     return 1;
   }
 
@@ -556,6 +770,28 @@ async function main() {
   if (willInstall) {
     await scanWithStatus(childEnvFor(FRONT_PORT));
     const projects = readProjects();
+
+    // A re-run with a healthy daemon of this same version IS the rescan: the
+    // daemon watches projects.json and reloads on its own, so replacing the
+    // LaunchAgent here would only kill the dev servers it is holding. The
+    // full install runs when nothing answers, the version changed (an npx of
+    // a newer release supersedes the installed copy), or the user typed
+    // `lazydev install` — the explicit form is the sanctioned way to force a
+    // plist rewrite, e.g. after the preflight flags a stale service PATH.
+    if (cmd !== 'install' && installedVersion() === VERSION) {
+      for (const port of [FRONT_PORT, FALLBACK_PORT]) {
+        if (await probeListen(port)) {
+          printInstalledBanner({ projects, port, startedAt, skillInstalled: false, verb: 'rescanned' });
+          // Preflight against the DEPLOYED plist PATH — what the daemon is
+          // actually resolving with right now. A tool that broke or diverged
+          // since install surfaces here, on the next casual `lazydev`, not at
+          // 3am via a start timeout.
+          printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
+          return 0;
+        }
+      }
+    }
+
     let result;
     const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
     spin.start('installing the LaunchAgent');
@@ -576,6 +812,9 @@ async function main() {
     }
     await spin.done(`${ui.green('✓')} ${ui.dim('service running')}`);
     printInstalledBanner({ projects, port: result.port, startedAt, skillInstalled: result.skillInstalled });
+    // The plist was just written, so deployedPathEnv() reads the fresh PATH:
+    // this proves what the daemon will resolve, on the install that baked it.
+    printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
     return 0;
   }
 
