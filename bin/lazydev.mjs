@@ -28,7 +28,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from '../lib/state.mjs';
 import { decideBindFallback, formatProjectUrl } from '../lib/bind.mjs';
-import { makeStyler } from '../lib/ui.mjs';
+import { makeStyler, makeSpinner, LOGO } from '../lib/ui.mjs';
 import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory } from '../lib/install.mjs';
 
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
@@ -183,16 +183,17 @@ function readProjects() {
 }
 
 async function scanWithStatus(env) {
-  const tty = process.stdout.isTTY;
-  if (tty) process.stdout.write(ui.dim('  scanning ~ for projects...'));
+  const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
+  spin.start(`scanning ${tilde(os.homedir())} for projects`);
   try {
     await runScan(env);
   } catch (err) {
-    if (tty) process.stdout.write('\r\x1b[2K');
+    spin.fail();
     process.stderr.write(`lazydev: scan failed (${err.message}); continuing with whatever registry exists.\n`);
     return;
   }
-  if (tty) process.stdout.write('\r\x1b[2K');
+  const n = readProjects().length;
+  await spin.done(`${ui.green('✓')} ${ui.dim(`found ${n} project${n === 1 ? '' : 's'}`)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,36 +207,23 @@ async function askConsent({ willInstall, willInstallSkill }) {
   const { bold, dim, cyan } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
   out();
-  out(`  ${cyan(bold('lazydev'))} ${dim(`v${VERSION}`)}`);
+  for (const line of LOGO) out(`  ${cyan(line)}`);
   out();
-  out('  this will:');
+  out(`  ${dim(`v${VERSION} · dev servers on demand behind permanent URLs`)}`);
   out();
-  out('  1. walk your home folder for projects it can prove how to run: node with');
-  out('     a "dev" script, rails apps, django with a venv or lockfile, static');
-  out('     folders with their own git repo. it reads marker files (package.json,');
-  out('     manage.py) and nothing inside your projects is written or changed.');
-  out(`  2. give each project a permanent URL like ${bold('http://myapp.localhost')},`);
-  out('     reachable only from this machine. connections from the network are');
-  out('     refused, and nothing you have leaves your computer.');
+  out(`  scan ~ for projects it can prove how to run ${dim('· reads marker files, writes nothing')}`);
+  out(`  serve each at ${bold('http://<name>.localhost')} ${dim('· this machine only, nothing leaves it')}`);
   if (willInstall) {
-    out('  3. install a background service (a user LaunchAgent, no sudo) so the');
-    out('     URLs keep working after reboots and closed terminals.');
+    out(`  install a user LaunchAgent ${dim('· no sudo, the URLs survive reboots')}`);
     if (willInstallSkill) {
-      out('  4. add the add-project skill to ~/.claude/skills, so your coding');
-      out('     agent can register anything the scanner cannot prove (Flask, Go,');
-      out('     docker-compose) as one registry entry.');
+      out(`  add the add-project skill to ~/.claude/skills ${dim("· for what the scan can't prove")}`);
     }
     out();
-    out(dim(`  everything it creates lives in ${tilde(stateDir)}, plus one plist in`));
-    out(dim(`  ~/Library/LaunchAgents and one symlink in ~/.local/bin.`));
-    out(dim('  `lazydev uninstall` removes every trace.'));
+    out(dim(`  everything lands in ${tilde(stateDir)} · \`lazydev uninstall\` removes every trace`));
   } else {
-    out('  3. serve those URLs in the foreground until you press Ctrl-C. (the');
-    out('     background service is macOS launchd for now; a systemd port is the');
-    out('     PR I\'d merge first.)');
+    out(`  serve them in the foreground ${dim('· Ctrl-C stops it; a systemd port is the PR I\'d merge first')}`);
     out();
-    out(dim(`  everything it creates lives in ${tilde(stateDir)}; deleting that`));
-    out(dim('  one directory removes every trace.'));
+    out(dim(`  everything lands in ${tilde(stateDir)} · deleting it removes every trace`));
   }
   out();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -288,7 +276,7 @@ function copyApp() {
   }
 }
 
-async function installPersistent() {
+async function installPersistent({ onStep = () => {} } = {}) {
   const domain = `gui/${process.getuid()}`;
 
   // Stop any existing agent first (this label covers the old checkout install
@@ -343,6 +331,7 @@ async function installPersistent() {
 
   // Wait for the daemon: :80 when it won the front door (or a legacy Caddy is
   // forwarding), else the fallback port. Report the port that answers.
+  onStep('waking the daemon');
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (await probeListen(FRONT_PORT)) return { up: true, port: FRONT_PORT, skillInstalled };
@@ -561,25 +550,31 @@ async function main() {
       process.stdout.write('  ok. nothing was scanned, nothing was installed.\n\n');
       return 0;
     }
+    process.stdout.write('\n');
   }
 
   if (willInstall) {
     await scanWithStatus(childEnvFor(FRONT_PORT));
     const projects = readProjects();
     let result;
+    const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
+    spin.start('installing the LaunchAgent');
     try {
-      result = await installPersistent();
+      result = await installPersistent({ onStep: (t) => spin.update(t) });
     } catch (err) {
+      spin.fail();
       process.stderr.write(`lazydev: install failed: ${err.message}\n`);
       return 1;
     }
     if (!result.up) {
+      spin.fail();
       process.stderr.write(
         `lazydev: the service was installed but the daemon did not answer within 10s.\n` +
         `check ${tilde(logsDir)}/daemon.err and daemon.log, then run \`lazydev\` again.\n`
       );
       return 1;
     }
+    await spin.done(`${ui.green('✓')} ${ui.dim('service running')}`);
     printInstalledBanner({ projects, port: result.port, startedAt, skillInstalled: result.skillInstalled });
     return 0;
   }

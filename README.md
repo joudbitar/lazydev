@@ -9,30 +9,28 @@ There is one way to get it, and it asks before it does anything:
 ```
 $ npx @jbitar/lazydev
 
-  lazydev v0.1.0
+   _                         _                      Z
+  | |  __ _  ____ _   _   __| |  ___ __   __      z
+  | | / _` ||_  /| | | | / _` | / _ \\ \ / /    z
+  | || (_| | / / | |_| || (_| ||  __/ \ V /
+  |_| \__,_|/___| \__, | \__,_| \___|  \_/
+                  |___/
 
-  this will:
+  v0.2.2 · dev servers on demand behind permanent URLs
 
-  1. walk your home folder for projects it can prove how to run: node with
-     a "dev" script, rails apps, django with a venv or lockfile, static
-     folders with their own git repo. it reads marker files (package.json,
-     manage.py) and nothing inside your projects is written or changed.
-  2. give each project a permanent URL like http://myapp.localhost,
-     reachable only from this machine. connections from the network are
-     refused, and nothing you have leaves your computer.
-  3. install a background service (a user LaunchAgent, no sudo) so the
-     URLs keep working after reboots and closed terminals.
-  4. add the add-project skill to ~/.claude/skills, so your coding
-     agent can register anything the scanner cannot prove (Flask, Go,
-     docker-compose) as one registry entry.
+  scan ~ for projects it can prove how to run · reads marker files, writes nothing
+  serve each at http://<name>.localhost · this machine only, nothing leaves it
+  install a user LaunchAgent · no sudo, the URLs survive reboots
+  add the add-project skill to ~/.claude/skills · for what the scan can't prove
 
-  everything it creates lives in ~/.local/state/lazydev, plus one plist in
-  ~/Library/LaunchAgents and one symlink in ~/.local/bin.
-  `lazydev uninstall` removes every trace.
+  everything lands in ~/.local/state/lazydev · `lazydev uninstall` removes every trace
 
   proceed? [Y/n] y
 
-  lazydev v0.1.0  installed in 1214 ms
+  ✓ found 3 projects
+  ✓ service running
+
+  lazydev v0.2.2  installed in 1214 ms
 
   dashboard  http://lazydev.localhost
   projects   http://<name>.localhost for each of 3 projects, e.g. http://portfolio.localhost
