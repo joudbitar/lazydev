@@ -13,7 +13,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node
 import { join } from 'node:path';
 import os from 'node:os';
 
-import { detectRails, detectDjango, detectStatic, normalizeScanRoots } from '../lib/detect.mjs';
+import { detectRails, detectDjango, detectStatic, normalizeScanRoots, hardcodedPort } from '../lib/detect.mjs';
 
 const ROOT = mkdtempSync(join(os.tmpdir(), 'lazydev-detect-'));
 after(() => rmSync(ROOT, { recursive: true, force: true }));
@@ -135,4 +135,30 @@ test('scanRoots drops junk: non-strings, relative paths, nested and duplicate ro
     normalizeScanRoots([42, null, 'relative/path', '/opt/a', '/opt/a', '/opt/a/nested'], '/home/u'),
     ['/opt/a']
   );
+});
+
+// --- hardcodedPort --------------------------------------------------------
+// A dev script that pins its own port ignores the injected PORT, so the
+// scanner must register the pinned port or every start times out (the
+// tradepulse incident: `next dev -p 3000` registered on 3110).
+
+test('hardcodedPort reads -p / --port / --port= as standalone tokens', () => {
+  assert.equal(hardcodedPort('next dev -p 3000'), 3000);
+  assert.equal(hardcodedPort('next dev --turbopack -p 3000'), 3000);
+  assert.equal(hardcodedPort('react-scripts start --port 4200'), 4200);
+  assert.equal(hardcodedPort('node server.js --port=8080'), 8080);
+});
+
+test('hardcodedPort returns null when the script leaves the port to the env', () => {
+  assert.equal(hardcodedPort('next dev'), null);
+  assert.equal(hardcodedPort('next dev --turbopack'), null);
+  assert.equal(hardcodedPort(undefined), null);
+});
+
+test('hardcodedPort never matches flags glued inside other words or junk values', () => {
+  assert.equal(hardcodedPort('serve --no-port 3000'), null, '--no-port is not --port');
+  assert.equal(hardcodedPort('run top-p 3000'), null, 'suffix of another word');
+  assert.equal(hardcodedPort('next dev -p 99999'), null, 'out of range');
+  assert.equal(hardcodedPort('next dev -p 0'), null, 'port 0 is not a real pin');
+  assert.equal(hardcodedPort('next dev -p'), null, 'flag with no value');
 });

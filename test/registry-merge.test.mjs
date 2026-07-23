@@ -179,3 +179,79 @@ test('carries over hand-added entries whose dir exists and drops those whose dir
   // Carry-over whose dir is gone: dropped entirely.
   assert.equal(byHost(projects, 'ghost'), undefined, 'ghost entry should be dropped');
 });
+
+// --- fixedPort ------------------------------------------------------------
+// fixedPort rides on a candidate whose dev script hardcodes its own port
+// (scan.mjs parses the script). The app binds that port no matter what the
+// registry says, so the merge must follow the script — except when the user
+// hand-replaced the startCmd, which makes the port their call again.
+
+test('a new host with fixedPort registers on it, and pool assignment steers around it', () => {
+  const candidates = [
+    { dir: '/tmp/x/pinned', name: 'pinned', framework: 'next', pm: 'pnpm', fixedPort: 3010 },
+    { dir: '/tmp/x/other', name: 'other', framework: 'next', pm: 'npm' },
+  ];
+  const projects = mergeRegistry({
+    existing: null,
+    candidates,
+    reservedHost: 'lazydev',
+    poolStart: 3010,
+    poolStep: 10,
+    startCmdFor,
+    sanitizeHost,
+    dirExists,
+  });
+  assert.equal(byHost(projects, 'pinned').port, 3010, 'script-pinned port wins');
+  assert.notEqual(byHost(projects, 'other').port, 3010, 'pool skips the pinned port');
+});
+
+test('a known host whose script pins a port is corrected away from a stale pool port', () => {
+  // The tradepulse case: registered on pool port 3110, but the dev script says
+  // -p 3000. The registered port is a guaranteed start timeout; the rescan
+  // must repair it.
+  const existing = {
+    projects: [
+      { host: 'tradepulse', dir: REPO_ROOT, port: 3110, startCmd: 'pnpm run dev', framework: 'next', enabled: true },
+    ],
+  };
+  const candidates = [
+    { dir: REPO_ROOT, name: 'tradepulse', framework: 'next', pm: 'pnpm', fixedPort: 3000 },
+  ];
+  const projects = mergeRegistry({
+    existing,
+    candidates,
+    reservedHost: 'lazydev',
+    poolStart: 3010,
+    poolStep: 10,
+    startCmdFor,
+    sanitizeHost,
+    dirExists,
+  });
+  assert.equal(byHost(projects, 'tradepulse').port, 3000, 'registry follows the script');
+});
+
+test('a hand-set startCmd keeps its hand-set port even when the package.json script pins one', () => {
+  // The user replaced the command entirely; the package.json dev script is no
+  // longer what runs, so its port pin is not evidence about anything.
+  const existing = {
+    projects: [
+      { host: 'webapp', dir: REPO_ROOT, port: 4500, startCmd: 'pnpm run dev:custom -- -p 4500', framework: 'next', enabled: true },
+    ],
+  };
+  const candidates = [
+    { dir: REPO_ROOT, name: 'webapp', framework: 'next', pm: 'pnpm', fixedPort: 3000 },
+  ];
+  const projects = mergeRegistry({
+    existing,
+    candidates,
+    reservedHost: 'lazydev',
+    poolStart: 3010,
+    poolStep: 10,
+    startCmdFor,
+    sanitizeHost,
+    dirExists,
+  });
+  const webapp = byHost(projects, 'webapp');
+  assert.equal(webapp.port, 4500, 'hand-set port survives');
+  assert.equal(webapp.startCmd, 'pnpm run dev:custom -- -p 4500', 'hand-set cmd survives');
+});

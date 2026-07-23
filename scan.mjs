@@ -11,7 +11,7 @@ import { readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 
 import { join, basename, dirname } from 'node:path';
 import os from 'node:os';
 import { mergeRegistry } from './lib/registry.mjs';
-import { detectRails, detectDjango, detectStatic, normalizeScanRoots } from './lib/detect.mjs';
+import { detectRails, detectDjango, detectStatic, normalizeScanRoots, hardcodedPort } from './lib/detect.mjs';
 import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
 
 const HOME = os.homedir();
@@ -167,7 +167,13 @@ for (const { dir, det } of found) {
   const framework = frameworkOf(pkg);
   // Plain node project whose dev script doesn't look like a web/dev server.
   if (framework === 'node' && !SERVER_HINT.test(dev)) continue;
-  candidates.push({ dir, name: basename(dir), pm: pmOf(dir), framework, dev });
+  // A PORT-env framework whose dev script pins its own port (`next dev -p
+  // 3000`) will bind that port regardless of the injected PORT — register the
+  // port the app will actually use, or every start times out. Vite-based
+  // scripts are exempt: startCmdFor appends `--port <pool>` after the script's
+  // own flags, and last-flag-wins hands the pool port back to us.
+  const fixedPort = VITE_BASED.has(framework) ? null : hardcodedPort(dev);
+  candidates.push({ dir, name: basename(dir), pm: pmOf(dir), framework, dev, ...(fixedPort ? { fixedPort } : {}) });
 }
 
 // ---------------------------------------------------------------------------
