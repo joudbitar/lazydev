@@ -214,6 +214,68 @@ test('C: external listener with mismatching cwd is a conflict, never proxied', a
   assert.equal(fake.count, 0, 'up attempt must not proxy to the foreign server either');
 });
 
+test('E: adopted upstream that dies is healed, and re-adopted when it returns', async (t) => {
+  // The adopt-then-die wedge: an ADOPTED server (owned=false, no child) has no
+  // exit handler, so when it dies the record stays 'running' and — pre-fix —
+  // every request 502'd until a daemon restart. The fix flips the record on a
+  // connection-level proxy failure and kicks a fresh bring-up, so the next
+  // attempt re-probes the port and re-adopts whatever answers.
+  const fake = fakeDevServer('hello-before');
+  const fakePort = await listen(fake.srv);
+  writeRegistry(fakePort, PROJECT_DIR);
+  loadConfig('test-E');
+  __setResolvePidCwd(() => PROJECT_DIR);
+
+  const daemon = createDaemonServer();
+  const daemonPort = await listen(daemon);
+  let fake2;
+  t.after(() => {
+    daemon.close();
+    try { fake.srv.close(); } catch { /* already closed mid-test */ }
+    if (fake2) fake2.srv.close();
+  });
+
+  const res1 = await httpGet(daemonPort, 'proj.localhost', '/');
+  assert.equal(res1.status, 200, 'sanity: the external server is adopted and proxied');
+  assert.equal(res1.body, 'hello-before');
+
+  // The adopted server dies, keep-alive sockets and all.
+  await new Promise((resolve) => {
+    fake.srv.close(resolve);
+    fake.srv.closeAllConnections();
+  });
+
+  // Pre-fix this request was the start of the forever-502. Post-fix the daemon
+  // notices the stale 'running', answers like a cold start (plain 503 for a
+  // non-HTML client), and re-arms bring-up behind it.
+  const res2 = await httpGet(daemonPort, 'proj.localhost', '/');
+  assert.equal(res2.status, 503, `dead adopted upstream should heal to a cold 503, got ${res2.status}`);
+
+  // The server comes back on the same port from the same dir — the user
+  // restarted the dev server they had started by hand. Poll briefly: the
+  // heal's own background bring-up may still be settling.
+  fake2 = fakeDevServer('hello-again');
+  await new Promise((resolve, reject) => {
+    fake2.srv.once('error', reject);
+    fake2.srv.listen(fakePort, '127.0.0.1', resolve);
+  });
+  let res3;
+  for (let i = 0; i < 20; i++) {
+    res3 = await httpGet(daemonPort, 'proj.localhost', '/');
+    if (res3.status === 200) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(res3.status, 200, `upstream returned; expected re-adopt + 200, got ${res3.status}`);
+  assert.equal(res3.body, 'hello-again', 'the proxied body comes from the returned server');
+
+  const entry = await statusFor(daemonPort, 'proj');
+  // Whether recovery landed as a re-adopt or as the respawn racing the
+  // returned listener is a timing coin-flip; the guarantee is 'running', not
+  // how it got there. (And if the record is stale-owned, the NEXT connection
+  // failure trips the same heal — ownedAlive checks the child's exitCode.)
+  assert.equal(entry.state, 'running', 'healed record is running again');
+});
+
 test('D: unresolved cwd (lsof unavailable) degrades to legacy adopt', async (t) => {
   const fake = fakeDevServer('hello-from-fake');
   const fakePort = await listen(fake.srv);

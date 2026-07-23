@@ -1449,6 +1449,47 @@ function proxyHttp(req, res, project) {
 
   upstream.on('error', (err) => {
     log(`proxy-error: ${host}: ${err.code || err.message} on ${upHost}:${project.port}`);
+
+    // Adopt-then-die heal. An ADOPTED upstream (owned=false, no child) that
+    // dies leaves nothing to flip the record: the exit handler only covers
+    // children we spawned, so state stays 'running' and every request lands
+    // here — a 502 forever, wedged until a daemon restart. A connection-level
+    // failure with no live owned child behind the record means the "running"
+    // claim is stale: drop it and kick a fresh bring-up, which re-probes the
+    // port (re-adopting if something answered after all — a false trip costs
+    // one probe) or respawns. Guarded on the owned child precisely because a
+    // live child's blips are its exit handler's business, and healing there
+    // would spawn a second process group behind a healthy server.
+    const gone = err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET' || err.code === 'EPIPE';
+    const ownedAlive = r && r.owned && r.child && r.child.exitCode === null;
+    if (gone && r && r.state === 'running' && !ownedAlive) {
+      log(`heal: ${host} adopted upstream on ${upHost}:${project.port} is gone -> stopped + fresh bring-up`);
+      r.state = 'stopped';
+      r.owned = false;
+      r.child = null;
+      r.pid = null;
+      r.upstreamHost = null;
+      r.lastError = { code: err.code, message: `upstream ${upHost}:${project.port} stopped answering`, at: Date.now() };
+      if (!r.startPromise) ensureUp(project).catch(() => {});
+      if (!res.headersSent) {
+        // Answer like the cold path so the browser self-recovers: the status
+        // page polls until the fresh bring-up lands, then reloads into the app.
+        if (wantsHtml(req)) {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(statusPageHtml(project, { state: 'starting' }, isControlAuthorized(req)));
+        } else {
+          sendRetry(res, project, { state: 'starting' });
+        }
+      } else {
+        try {
+          res.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+      return;
+    }
+
     if (!res.headersSent) {
       sendHtml(
         res,
